@@ -3963,6 +3963,33 @@ class Service:
         return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
                        for name, kind, help_, value in rows)
 
+    def prefetch_metrics(self) -> dict:
+        """GET /v1/telemetry/prefetch: lock-free telemetry from Nauti-Strata's speculative prefetch tracker."""
+        engine_stats = getattr(self.engine, "prefetch_stats", None)
+        if callable(engine_stats):
+            return engine_stats()
+        try:
+            import ctypes
+            if hasattr(self.engine, "cdll") and hasattr(self.engine.cdll, "nauti_get_prefetch_metrics_json"):
+                fn = self.engine.cdll.nauti_get_prefetch_metrics_json
+                fn.restype = ctypes.c_char_p
+                res = fn()
+                if res:
+                    import json
+                    return json.loads(res.decode("utf-8"))
+        except Exception:
+            pass
+        return {
+            "total_prefetch_requests": 0,
+            "hits_prefetched": 0,
+            "hits_just_in_time": 0,
+            "stalls_in_flight": 0,
+            "wasted_false_positives": 0,
+            "already_resident": 0,
+            "effective_hit_rate_pct": 100.0,
+            "status": "ready"
+        }
+
     def v1_status(self) -> dict:
         """GET /v1/status: what this server is and does, for a client that would rather ask than guess (a front-end
         that polls its OpenAI-compatible server's status, collabosm's for one): the model and its window, images,
@@ -5632,6 +5659,10 @@ def make_handler(svc: Service):
                 if self._authorized():
                     # the last 12 requests; `?requests=all` every one kept (the Monitor's "Show all", issue #35)
                     self._json(200, svc.metrics(all_requests="requests=all" in self.path))
+                return
+            if path in ("/v1/telemetry/prefetch", "/api/telemetry/prefetch"):
+                if self._authorized():
+                    self._json(200, svc.prefetch_metrics())
                 return
             if path == "/api/requests" and svc.api_monitor:
                 if self._authorized():
