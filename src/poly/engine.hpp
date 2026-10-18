@@ -436,6 +436,7 @@ protected:
     void lin(const Dev& w, const float* x, float* y, int n, const void* xq = nullptr, int rows_per_x = 0);
     void fill_expert_cache();
     void start_swaps();
+    uint64_t prefetch_expert(int target_il, int target_e, int lead = 2);
     void plan_ahead(Layer& L, int il);
     void run(const int32_t* tokens, int n);
     bool pick_way(int t);

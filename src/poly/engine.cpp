@@ -1,6 +1,7 @@
 // src/poly/engine.cpp - see the header.  What every architecture shares: the files, the weights' way to VRAM, the
 // routed experts (the cache, the CPU, a prompt batch), the sequence's state, and the calls that feed tokens.
 #include "engine.hpp"
+#include "nauti_prefetch.hpp"
 
 #include "deepseek4.hpp"
 #include "gemma4.hpp"
@@ -1249,6 +1250,74 @@ void Engine::start_swaps() {
     recent_.assign(use_.size(), 0.f);
     coming_.assign(use_.size(), 0);
     follower_ = std::thread([this] { follow_loop(); });
+}
+
+// Speculative Lookahead MoE Expert Prefetching: proactively queues an async DMA transfer
+// into VRAM on the non-blocking swap_st_ stream before the forward pass arrives at target_il.
+uint64_t Engine::prefetch_expert(int target_il, int target_e, int lead) {
+    if (!swap_ || n_swap_ <= 0 || target_il < 0 || target_il >= (int) layers_.size() || target_e < 0 || target_e >= n_expert_) {
+        return 0;
+    }
+    const size_t ne = (size_t) n_expert_;
+    const size_t idx = (size_t) target_il * ne + (size_t) target_e;
+    Layer& L = layers_[(size_t) target_il];
+
+    // 1. If already resident in VRAM, record hit immediately and return
+    if (L.slot[(size_t) target_e] != nullptr) {
+        uint64_t req = nauti::global_prefetch_tracker().record_request(target_il, target_e, lead);
+        nauti::global_prefetch_tracker().record_outcome(req, nauti::PrefetchOutcome::ALREADY_RESIDENT);
+        return req;
+    }
+
+    // 2. If already in flight, don't duplicate transfer
+    if (coming_[idx]) {
+        return 0;
+    }
+
+    // 3. Find a free swap slot in the pool
+    Swap* s = nullptr;
+    for (int j = 0; j < n_swap_ && !s; ++j) {
+        if (swap_[(size_t) j].at.load() == Swap::kFree) {
+            s = &swap_[(size_t) j];
+        }
+    }
+    if (!s) return 0;
+
+    // 4. Find the coldest cached expert in target_il to sacrifice/evict
+    int out_e = -1;
+    float lowest_rec = 1e9f;
+    int64_t lowest_prior = 1e9;
+    for (int e = 0; e < n_expert_; ++e) {
+        if (L.slot[(size_t) e] != nullptr) {
+            size_t cand_i = (size_t) target_il * ne + (size_t) e;
+            float r = recent_.empty() ? 0.f : recent_[cand_i];
+            int64_t p = prior_.empty() ? 0 : prior_[cand_i];
+            if (r < lowest_rec || (r == lowest_rec && p < lowest_prior)) {
+                lowest_rec = r;
+                lowest_prior = p;
+                out_e = e;
+            }
+        }
+    }
+    if (out_e < 0) return 0;
+
+    uint8_t*& given = L.slot[(size_t) out_e];
+    uint64_t req = nauti::global_prefetch_tracker().record_request(target_il, target_e, lead);
+
+    s->il = target_il;
+    s->e  = target_e;
+    s->slot = given;
+    given = nullptr;
+    staged_il_ = -1;
+    coming_[idx] = 1;
+    s->at.store(Swap::kAsked);
+
+    {
+        std::lock_guard<std::mutex> l(swap_m_);
+    }
+    swap_cv_.notify_one();
+
+    return req;
 }
 
 // The cache gives up what it has and is filled again for another reserve.  The experts on their way into it
