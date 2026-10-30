@@ -49,6 +49,7 @@ This fork incorporates verified hardware support and fixes for Pascal architectu
 - **Non-Tensor cuBLAS Fallback**: Replaces tensor-op-only defaults with clean SIMT fallbacks, eliminating `CUBLAS_STATUS_ARCH_MISMATCH = 8`.
 - **Multi-GPU Layer Splitting**: Validated on dual Tesla P100s (Gen3 x16) running 35B MoE architectures (KAT-Coder / Qwen3.6 / Tiel Coder) at 52+ tok/s decode.
 - **Enterprise CPU Support**: Resolves `SIGILL` crashes on Sandy Bridge-EP / Ivy Bridge-EP Xeon CPUs via `-DSTRATA_ISA_FLOOR=avx`.
+- **Lemonade**: PolyStrata runs as a [Lemonade](https://github.com/lemonade-sdk/lemonade) provider; see [docs/LEMONADE.md](docs/LEMONADE.md) (tested on a Tesla P100, 47.7 tok/s through Lemonade).
 - **Active Research**: Early work on speculative multi-layer lookahead scheduling and asynchronous PCIe streaming for older and memory-constrained accelerators. See [docs/OLDER_GPUS.md](docs/OLDER_GPUS.md).
 
 PolyStrata is built on [Strata](https://github.com/Niko1221/Strata) by Niko1221.

@@ -1310,6 +1310,20 @@ class UnfinishedToolCall(unittest.TestCase):
         msg = openai_collect([chunk({"tool_calls": [cut]}), chunk({}, "stop")])["choices"][0]["message"]
         self.assertNotIn("tool_calls", msg)
 
+    def test_collect_content_is_a_string_without_calls(self):
+        """A reply that hit max_tokens while thinking has no answer: content is "" (a string), and null only when the
+        reply carries tool calls, as OpenAI sends it. Lemonade's provider route failed on null content."""
+        from serve.server import openai_collect
+
+        def chunk(delta, finish=None):
+            return {"id": "c", "created": 1, "model": "m", "usage": {},
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+        msg = openai_collect([chunk({"reasoning_content": "thinking"}), chunk({}, "length")])["choices"][0]["message"]
+        self.assertEqual(msg["content"], "")
+        call = {"index": 0, "id": "a", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+        msg = openai_collect([chunk({"tool_calls": [call]}), chunk({}, "tool_calls")])["choices"][0]["message"]
+        self.assertIsNone(msg["content"])
+
     def test_a_whole_call(self):
         whole = {"path": "notes.txt", "content": "all of it"}
         a = self.answers(self.WHOLE)
