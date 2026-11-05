@@ -105,6 +105,14 @@ class ServiceForGlm(unittest.TestCase):
         self.assertEqual(chatml.stop_ids, {257, 258})       # <|im_end|>, <|endoftext|>
         self.assertEqual(chatml.call_format, "function")
 
+    def test_next_turn_ends_the_reply_when_the_gguf_does_not_name_it(self):
+        # GLM 5.3 Flash GSQ-RCO names only <|endoftext|> for eos/eot/eom, and its replies ran on past <|user|>
+        class OnlyEos(GlmTokens):
+            special_ids = {"tokenizer.ggml.eos_token_id": 256, "tokenizer.ggml.eot_token_id": 256,
+                           "tokenizer.ggml.bos_token_id": 259}
+        svc = self.service(OnlyEos(), "<|assistant|><think>")
+        self.assertEqual(svc.stop_ids, {256, 257, 258})     # <|endoftext|>, <|user|>, <|observation|>
+
     def test_thinking_off_closes_the_open_block(self):
         svc = self.service(GlmTokens(), "{{ messages[0].content }}<|assistant|><think>")
         msgs = [{"role": "user", "content": "q"}]

@@ -3172,6 +3172,13 @@ class Service:
                                                  for s in TURN_OPENERS[self.call_format]) if len(t) == 1)
         self.engine.turn_ids = self.turn_ids            # the GEN line's turn_at (StrataEngine.turn_key)
         self.think_open_ids = []
+        if self.call_format == "glm":
+            # GLM opens the next turn with <|user|> (or <|observation|> for a tool's answer) and its GGUF may name
+            # neither as eos/eot/eom (GLM 5.3 Flash GSQ-RCO: the reply ran on past <|user|> to max_tokens).
+            # llama.cpp ends a GLM reply on both; so does this.
+            for tag in ("<|user|>", "<|observation|>"):
+                ids = tokenizer.encode(tag, parse_special=True)
+                self.stop_ids |= set(ids if len(ids) == 1 else [])
         if self.call_format == "gemma":
             # after its calls Gemma opens the tools' answer, which is the client's to give: the reply ends there.
             # Its template opens the reasoning for it after a tool's answer; run() looks for that at the prompt's end
