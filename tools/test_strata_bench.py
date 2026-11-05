@@ -340,5 +340,91 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(B.main(["--url", "http://127.0.0.1:9", "--quiet"]), 2)
 
 
+class FakeLlama(FakeStrata):
+    """A llama.cpp server: no PolyStrata /health service, its own /props, and it records the model each request names."""
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.RequestHandlerClass = LlamaHandler
+        self.models_asked = []
+
+
+class LlamaHandler(Handler):
+    def do_GET(self):
+        s = self.server
+        if self.path == "/health":
+            self.send_json({"status": "ok"})
+        elif self.path == "/props":
+            self.send_json({"total_slots": 1, "build_info": "b9999-abc", "default_generation_settings": {"n_ctx": s.ctx}})
+        elif self.path == "/v1/models":
+            self.send_json({"object": "list", "data": [{"id": "flint-40b-a2.5b"}]})
+        else:
+            self.send_json({}, 404)
+
+    def do_POST(self):
+        length = int(self.headers["Content-Length"])
+        raw = self.rfile.read(length)
+        self.server.models_asked.append(json.loads(raw).get("model"))
+        self.rfile = io.BytesIO(raw)                     # Handler.do_POST reads the body again
+        super().do_POST()
+
+
+class AnyServerTests(unittest.TestCase):
+    def setUp(self):
+        p = mock.patch.object(B, "gpu_info_local", return_value={"gpus": []})
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(setattr, B, "REQUEST_MODEL", B.REQUEST_MODEL)
+
+    def test_a_llama_cpp_server_runs_the_same_suite(self):
+        srv = FakeLlama()
+        self.addCleanup(srv.stop)
+        self.assertEqual(B.server_kind(srv.base, ""), "llama.cpp")
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(B.main(["--url", srv.base, "--out", d, "--runs", "1", "--quiet"]), 0)
+            raw = json.loads(next(Path(d).iterdir()).joinpath("results.json").read_text(encoding="utf-8"))
+        self.assertEqual(raw["machine"]["server"], "llama.cpp")
+        self.assertEqual(raw["machine"]["model"], "flint-40b-a2.5b")
+        self.assertEqual(raw["results"]["chat"]["decode_tps"]["median"], 60.0)
+        self.assertTrue(raw["results"]["cold"]["ok"])                       # the first request is kept as the cold row
+        self.assertEqual(set(srv.models_asked), {"flint-40b-a2.5b"})       # every request names the server's own model
+
+    def test_fleet_benchmarks_every_seat_and_keeps_going_past_a_dead_one(self):
+        strata, llama = FakeStrata(), FakeLlama()
+        self.addCleanup(strata.stop)
+        self.addCleanup(llama.stop)
+        seats = {"glm": {"endpoint": strata.base + "/v1/chat/completions", "gpu": "4 cards"},
+                 "flint": {"endpoint": llama.base + "/v1/chat/completions"},
+                 "gone": {"endpoint": "http://127.0.0.1:9/v1/chat/completions"}}
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "seats.json"
+            f.write_text(json.dumps(seats), encoding="utf-8")
+            self.assertEqual(B.main(["--fleet", str(f), "--out", d, "--runs", "1", "--quiet"]), 0)
+            fdir = next(p for p in Path(d).iterdir() if p.is_dir() and p.name.endswith("-fleet"))
+            rows = json.loads((fdir / "fleet.json").read_text(encoding="utf-8"))
+            md = (fdir / "FLEET.md").read_text(encoding="utf-8")
+        self.assertEqual([r["name"] for r in rows], ["glm", "flint", "gone"])
+        self.assertEqual(rows[0]["server"], "polystrata")
+        self.assertEqual(rows[1]["server"], "llama.cpp")
+        self.assertEqual(rows[2]["error"], "no server answered")
+        self.assertEqual(rows[1]["metrics"]["chat decode tok/s"]["median"], 60.0)
+        self.assertEqual(llama.models_asked and set(llama.models_asked), {"flint-40b-a2.5b"})
+        self.assertIn("| flint | llama.cpp | flint-40b-a2.5b | 60.0 |", md)
+        self.assertIn("| gone |", md)
+
+    def test_fleet_entries_take_both_shapes(self):
+        self.assertEqual(B.fleet_entries([{"name": "a", "url": "http://h:1/v1/"}]), [{"name": "a", "url": "http://h:1", "gpu": None}])
+        self.assertEqual(B.fleet_entries({"b": {"endpoint": "http://h:2/v1/chat/completions", "label": "x"}}),
+                         [{"name": "b", "url": "http://h:2", "gpu": None}])
+
+    def test_a_stream_without_usage_takes_the_prompt_size_from_the_timings(self):
+        d = B.digest({"first": 0.1, "total": 1.0, "pieces": 5, "usage": None, "err": None,
+                      "timings": {"cache_n": 4134, "prompt_n": 1595, "prompt_per_second": 220.0, "predicted_per_second": 20.0}})
+        self.assertEqual((d["prompt_tokens"], d["reused_tokens"], d["read_tokens"]), (5729, 4134, 1595))
+
+    def test_a_remote_server_is_not_described_by_this_pcs_cards(self):
+        self.assertTrue(B.is_local("http://127.0.0.1:8080"))
+        self.assertFalse(B.is_local("http://10.44.0.14:8085"))
+
+
 if __name__ == "__main__":
     unittest.main()

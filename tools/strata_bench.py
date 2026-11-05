@@ -53,6 +53,7 @@ from agent_turns_bench import SYSTEM, TOOLS         # noqa: E402  the same agent
 import serve_load                                   # noqa: E402  the burst client for --clients
 
 SCHEMA = 1
+REQUEST_MODEL = "strata"   # the "model" of every request: main() sets the server's own model id for a server that is not PolyStrata
 CHAT_MAX_TOKENS = 100
 LONG_MAX_TOKENS = 24
 AGENT_MAX_TOKENS = 64
@@ -128,7 +129,8 @@ def try_json(base, path, key="", timeout=20):
 def chat(base: str, key: str, messages: list, max_tokens: int, think: bool = False, tools=None, timeout: float = 3600) -> dict:
     """One streamed chat request -> {first, total, text, usage, timings, err}.  `first` is the seconds to the first
     non-empty content or reasoning piece (keep-alives and empty deltas ignored)."""
-    body = {"model": "strata", "stream": True, "max_tokens": max_tokens, "temperature": 0, "messages": messages}
+    body = {"model": REQUEST_MODEL, "stream": True, "max_tokens": max_tokens, "temperature": 0, "messages": messages,
+            "stream_options": {"include_usage": True}}      # llama.cpp sends no usage in a stream unless asked
     if tools:
         body["tools"] = tools
     if not think:
@@ -186,6 +188,8 @@ def digest(r: dict) -> dict:
     read = t.get("prompt_n")
     if read is None and prompt_tokens is not None and cached is not None:
         read = prompt_tokens - cached
+    if prompt_tokens is None and read is not None:      # no usage (a llama.cpp stream): the engine's timings have both parts
+        prompt_tokens = read + (cached or 0)
     dec, dsrc = t.get("predicted_per_second"), "engine"
     if dec is None and r.get("first") is not None and gen > 1 and r["total"] > r["first"]:
         dec, dsrc = round((gen - 1) / (r["total"] - r["first"]), 1), "client"
@@ -228,7 +232,7 @@ class Suite:
         self.quick = quick
         self.nonce = str(int(time.time()))
         self.tokens_per_word, self.overhead = 1.1, 40
-        self.out: dict = {"chat": {}, "prompts": {}, "agent": {}, "clients": {}, "skipped": {}, "failures": []}
+        self.out: dict = {"cold": {}, "chat": {}, "prompts": {}, "agent": {}, "clients": {}, "skipped": {}, "failures": []}
 
     def tag(self, *parts) -> str:
         return "-".join([*map(str, parts), self.nonce])
@@ -254,8 +258,11 @@ class Suite:
         return [{"role": "user", "content": f"[bench {self.tag(run, tokens, 'p')}]\n" + long_prompt(words)}]
 
     def warm_up(self):
-        self.log("warming up (not measured) ...")
-        chat(self.base, self.key, [{"role": "user", "content": PROMPTS[0]}], 24, self.think)
+        self.log("warming up (the first request is kept as the cold numbers; the rest is not measured) ...")
+        cold = digest(chat(self.base, self.key, [{"role": "user", "content": f"[{self.tag('cold')}] {PROMPTS[0]}"}], 24, self.think))
+        self.out["cold"] = cold
+        if cold["ok"]:
+            self.log(f"  cold: first token {cold['ttft_s']} s, decode {cold['decode_tps']} tok/s, {cold['total_s']} s in all")
         self.calibrate()
         chat(self.base, self.key, self.prompt_for(1024, -1), 8, self.think)
 
@@ -414,6 +421,10 @@ class Suite:
 def summary_metrics(out: dict) -> dict:
     """The flat {name: stat} the --compare table and the README table read."""
     m = {"chat decode tok/s": out["chat"].get("decode_tps"), "chat first token (s)": out["chat"].get("ttft_s")}
+    cold = out.get("cold") or {}
+    if cold.get("ok"):
+        m["cold first token (s)"] = stat([cold.get("ttft_s")])
+        m["cold decode tok/s"] = stat([cold.get("decode_tps")])
     for k, v in out["prompts"].items():
         m[f"{k} prompt tok/s"] = v.get("prompt_tps")
         m[f"{k} first token (s)"] = v.get("ttft_s")
@@ -603,7 +614,7 @@ def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None =
     models = try_json(base, "/v1/models", key) or {}
     static = metrics.get("hardware_static") or {}
     eng = metrics.get("engine") or {}
-    local = gpu_info_local()
+    local = gpu_info_local() if is_local(base) else {"gpus": []}     # another machine's server: this PC's cards are not its
     view = config_view(cfg) if cfg else {}
     # #1985: only the GPUs the engine uses - the config's / --gpu selection; with none given the engine runs on one card
     # (the one the server reports), not on every card the PC has
@@ -638,7 +649,8 @@ def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None =
         "python": platform.python_version(),
         "strata_version": project_version(), "strata_commit": git_commit(),
         "engine_version": (eng.get("version") or status.get("engine") or str(props.get("build_info", "")).replace("Strata ", "") or None),
-        "model": view.get("model_name") or status.get("model") or props.get("model_alias"),
+        "model": view.get("model_name") or status.get("model") or props.get("model_alias") or first_model_id(models),
+        "server": server_kind(base, key),
         "quant": detect_quant(view) if view else None,
         "context": n_ctx or eng.get("max_context"), "parallel_slots": props.get("total_slots"),
         "config": view, "launch": launch_line(view) if view else None,
@@ -660,6 +672,33 @@ def find_configs(folder: Path = ROOT) -> list[Path]:
         if isinstance(c, dict) and c.get("exe") and isinstance(c.get("args"), list):
             out.append(p)
     return sorted(out, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def is_local(base: str) -> bool:
+    from urllib.parse import urlparse
+    return (urlparse(base).hostname or "") in ("127.0.0.1", "localhost", "::1", "")
+
+
+def first_model_id(models: dict | None) -> str | None:
+    for d in (models or {}).get("data") or []:
+        if d.get("id"):
+            return d["id"]
+    return None
+
+
+def server_kind(base: str, key: str) -> str | None:
+    """Which server answers: "polystrata", "llama.cpp", "lemonade", "openai" (any other /v1/models server) or None.  The suite
+    is the same for all of them; only PolyStrata reports its cards and expert cache, the others report what they have."""
+    if is_strata(base, key):
+        return "polystrata"
+    props = try_json(base, "/props", key, 5) or {}
+    if props.get("build_info") is not None or props.get("default_generation_settings"):
+        return "llama.cpp"
+    if try_json(base, "/api/v1/health", key, 5) is not None:
+        return "lemonade"
+    if try_json(base, "/v1/models", key, 5) is not None:
+        return "openai"
+    return None
 
 
 def is_strata(base: str, key: str) -> bool:
@@ -788,6 +827,10 @@ def results_table(out: dict) -> list[str]:
     lines = ["| Configuration | Actual prompt tokens | Reused tokens | Generated tokens | Runs | Prompt tok/s median and range | "
              "Decode tok/s median and range | TTFT seconds median and range |",
              "| --- | ---: | ---: | ---: | ---: | --- | --- | --- |"]
+    cold = out.get("cold") or {}
+    if cold.get("ok"):
+        lines.append(row("first request after load (cold)", cold.get("prompt_tokens") or "-", cold.get("reused_tokens") or 0,
+                         cold.get("generated_tokens"), 1, "not measured", cold.get("decode_tps") or "-", cold.get("ttft_s")))
     c = out["chat"]
     if c:
         lines.append(row("short chat", fmt(c.get("prompt_tokens"), 0), "0", fmt(c.get("generated_tokens"), 0),
@@ -832,9 +875,11 @@ def render_readme(res: dict) -> str:
     if env:
         L += ["Environment of the config: " + ", ".join(f"`{k}={v}`" for k, v in env.items()), ""]
     L += ["## Method", "",
-          f"Run by `{p['command']}` against the HTTP API of a PolyStrata server "
+          f"Run by `{p['command']}` against the HTTP API of a {mc.get('server') or 'PolyStrata'} server"
+          f"{' (seat ' + mc['seat'] + ')' if mc.get('seat') else ''} "
           f"({'started by the benchmark from the install configuration' if p['started_server'] else 'already running'}); model loading is not "
-          f"timed. One warm-up chat and a 1K prompt are discarded first. Every prompt starts with a unique tag, so the conversation "
+          f"timed. The first chat request is kept as the cold row (cold only if the server had just loaded); a calibration and a 1K "
+          f"prompt are discarded. Every prompt starts with a unique tag, so the conversation "
           f"cache cannot help the fresh-prompt tests.", "",
           f"- short chat: the three questions of `tools/ab_engine.py`, up to {CHAT_MAX_TOKENS} new tokens, {p['runs']} runs",
           f"- 4K / 16K{' / 32K' if 'prompt' in res['results'] and '32K' in res['results']['prompts'] else ''} prompts: generated word lists sized by a calibration request, "
@@ -932,9 +977,14 @@ def main(argv=None) -> int:
     ap.add_argument("--compare", metavar="DIR", help="a results folder (or its results.json) to put beside this run")
     ap.add_argument("--compare-only", metavar="NEW", help="print --compare of two existing results folders and stop")
     ap.add_argument("--ready-timeout", type=float, default=1800, help="seconds to wait for the model to load")
+    ap.add_argument("--fleet", metavar="SEATS.json", help="benchmark every server of this file, one at a time, and write one "
+                    "comparison table: a list [{\"name\", \"url\"}] or a seats map {name: {\"endpoint\": ...}}")
+    ap.add_argument("--only", metavar="A,B", help="with --fleet: only these seats")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args(argv)
     say = (lambda *x, **k: None) if a.quiet else (lambda *x, **k: print(*x, **k, flush=True))
+    if a.fleet:
+        return run_fleet(a, say)
 
     if a.compare_only:
         if not a.compare:
@@ -971,8 +1021,13 @@ def main(argv=None) -> int:
         if is_strata(base, key):
             say(f"Using the PolyStrata server already running at {base}.")
         elif a.url:
-            print(f"No PolyStrata server answers at {base}.", file=sys.stderr)
-            return 2
+            kind = server_kind(base, key)
+            if kind is None:
+                print(f"No PolyStrata or OpenAI-compatible server answers at {base}.", file=sys.stderr)
+                return 2
+            use_server_model(base, key)
+            say(f"Using the {kind} server at {base} (model {REQUEST_MODEL}): the same suite; the engine's own timings where it "
+                f"reports them, the client's otherwise.")
         else:
             if try_json(base, "/health", key, 3) is not None:
                 print(f"Port {port} is used by something that is not PolyStrata: pass --port N.", file=sys.stderr)
@@ -985,32 +1040,8 @@ def main(argv=None) -> int:
                 tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-15:] if log_path.exists() else []
                 print("The server did not become ready. Last log lines:\n" + red("\n".join(tail)), file=sys.stderr)
                 return 1
-        t0 = time.time()
-        pre = collect_machine(base, key, cfg, a.gpu)
-        suite = Suite(base, key, pre.get("context"), max(1, a.runs), a.think, log=say, want_clients=a.clients, want_long=a.long)
-        slots = pre.get("parallel_slots") or 1
-        if a.clients and a.clients > slots:
-            say(f"Note: the server runs {slots} request(s) at a time (--batch), so {a.clients} clients will partly wait their turn.")
-        say("Running the suite (about 3-10 minutes) ...")
-        out = suite.run()
-        machine = collect_machine(base, key, cfg, a.gpu)      # again: VRAM and the cache after the work
-        if not machine.get("gpu"):
-            machine["gpu"] = pre.get("gpu")
-        res = {"schema": SCHEMA, "tool": "tools/strata_bench.py", "date": datetime.date.today().isoformat(),
-               "params": {"runs": suite.runs, "think": a.think, "clients": a.clients, "long": a.long, "started_server": started,
-                          "command": "python tools/strata_bench.py" + "".join(
-                              f" {x}" for x in (f"--clients {a.clients}" if a.clients else "", "--long" if a.long else "",
-                                                "--think" if a.think else "", f"--runs {a.runs}" if a.runs != 3 else "") if x)},
-               "elapsed_s": time.time() - t0, "machine": machine, "results": out}
-        parent = Path(a.out) if a.out else ROOT / "bench" / "results"
-        d = write_results(res, parent, red, log_excerpt(log_path) if log_path else [])
-        say("\nResults (median, range over the runs):")
-        say(red(short_table(res)))
-        if out["failures"] or out["skipped"]:
-            say(f"  ({len(out['failures'])} failed request(s), {len(out['skipped'])} skipped test(s): see the report)")
-        if a.compare:
-            say("\nCompared with " + a.compare + ":")
-            say(red(compare_table(load_results(Path(a.compare)), redact_obj(res, lambda s: s))))
+        res, d = bench_server(base, key, cfg, a, say, red, started, log_path)
+        out = res["results"]
         try:
             shown = d.relative_to(ROOT)
         except ValueError:
@@ -1023,6 +1054,129 @@ def main(argv=None) -> int:
         if started:
             stop_server(proc)
 
+
+def use_server_model(base: str, key: str) -> None:
+    """A server that is not PolyStrata is asked for its own model by name: llama.cpp ignores the name, Lemonade and other
+    routers need it."""
+    global REQUEST_MODEL
+    REQUEST_MODEL = first_model_id(try_json(base, "/v1/models", key, 10)) or "default"
+
+
+def bench_server(base, key, cfg, a, say, red, started, log_path, gpu_hint=None, label=None):
+    """Run the suite against one server that is ready, write its results folder; -> (results, folder)."""
+    t0 = time.time()
+    pre = collect_machine(base, key, cfg, a.gpu)
+    if gpu_hint and not pre.get("gpu"):
+        pre["gpu"] = [gpu_hint]
+    suite = Suite(base, key, pre.get("context"), max(1, a.runs), a.think, log=say, want_clients=a.clients, want_long=a.long)
+    slots = pre.get("parallel_slots") or 1
+    if a.clients and a.clients > slots:
+        say(f"Note: the server runs {slots} request(s) at a time (--batch), so {a.clients} clients will partly wait their turn.")
+    say("Running the suite (about 3-10 minutes) ...")
+    out = suite.run()
+    machine = collect_machine(base, key, cfg, a.gpu)      # again: VRAM and the cache after the work
+    if not machine.get("gpu"):
+        machine["gpu"] = pre.get("gpu") or ([gpu_hint] if gpu_hint else [])
+    if label:
+        machine["seat"] = label
+    res = {"schema": SCHEMA, "tool": "tools/strata_bench.py", "date": datetime.date.today().isoformat(),
+           "params": {"runs": suite.runs, "think": a.think, "clients": a.clients, "long": a.long, "started_server": started,
+                      "command": "python tools/strata_bench.py" + "".join(
+                          f" {x}" for x in (f"--clients {a.clients}" if a.clients else "", "--long" if a.long else "",
+                                            "--think" if a.think else "", f"--runs {a.runs}" if a.runs != 3 else "") if x)},
+           "elapsed_s": time.time() - t0, "machine": machine, "results": out}
+    parent = Path(a.out) if a.out else ROOT / "bench" / "results"
+    d = write_results(res, parent, red, log_excerpt(log_path) if log_path else [])
+    say("\nResults (median, range over the runs):")
+    say(red(short_table(res)))
+    if out["failures"] or out["skipped"]:
+        say(f"  ({len(out['failures'])} failed request(s), {len(out['skipped'])} skipped test(s): see the report)")
+    if getattr(a, "compare", None):
+        say("\nCompared with " + a.compare + ":")
+        say(red(compare_table(load_results(Path(a.compare)), redact_obj(res, lambda s: s))))
+    return res, d
+
+
+# ------------------------------------------------------------------------------------------------------ the fleet
+def fleet_entries(obj) -> list[dict]:
+    """--fleet FILE: a list [{"name", "url", "gpu"?}] or a seats map {name: {"endpoint": ".../v1/chat/completions", "label"?,
+    "gpu"?}} (the gateway seats-file shape) -> [{"name", "url", "gpu"}]."""
+    items = obj.items() if isinstance(obj, dict) else ((e.get("name"), e) for e in obj)
+    out = []
+    for name, e in items:
+        if not isinstance(e, dict):
+            continue
+        url = (e.get("url") or e.get("endpoint") or "").strip().rstrip("/")
+        for tail in ("/v1/chat/completions", "/chat/completions", "/v1"):
+            if url.endswith(tail):
+                url = url[: -len(tail)]
+        if name and url:
+            out.append({"name": str(name), "url": url.rstrip("/"), "gpu": e.get("gpu")})
+    return out
+
+
+FLEET_COLUMNS = (("chat decode tok/s", 1), ("chat first token (s)", 2), ("4K prompt tok/s", 0), ("4K first token (s)", 2),
+                 ("agent cache hit %", 1), ("cold first token (s)", 2))
+
+
+def fleet_table(rows: list[dict]) -> str:
+    """One line per seat, the same columns for every server, medians."""
+    head = ["Seat", "Server", "Model", *[c for c, _ in FLEET_COLUMNS], "Failed", "Report"]
+    L = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    for r in rows:
+        if r.get("error"):
+            L.append("| " + " | ".join([r["name"], "-", "-", *["-"] * len(FLEET_COLUMNS), r["error"], "-"]) + " |")
+            continue
+        m = r["metrics"]
+        cells = [("-" if not m.get(c) else f"{m[c]['median']:.{dg}f}") for c, dg in FLEET_COLUMNS]
+        L.append("| " + " | ".join([r["name"], r.get("server") or "-", r.get("model") or "-", *cells, str(r.get("failed", 0)),
+                                    r.get("report") or "-"]) + " |")
+    return "\n".join(L)
+
+
+def run_fleet(a, say) -> int:
+    entries = fleet_entries(json.loads(Path(a.fleet).read_text(encoding="utf-8-sig")))
+    if a.only:
+        keep = {x.strip() for x in a.only.split(",") if x.strip()}
+        entries = [e for e in entries if e["name"] in keep]
+    if not entries:
+        print(f"No seats in {a.fleet}.", file=sys.stderr)
+        return 2
+    parent = Path(a.out) if a.out else ROOT / "bench" / "results"
+    fdir = unique_dir(parent, f"{datetime.date.today().isoformat()}-fleet")
+    fdir.mkdir(parents=True)
+    a.out = str(fdir)
+    rows = []
+    for i, e in enumerate(entries, 1):
+        say(f"\n=== [{i}/{len(entries)}] {e['name']} at {e['url']}")
+        key = a.api_key
+        kind = server_kind(e["url"], key)
+        if kind is None:
+            rows.append({"name": e["name"], "error": "no server answered"})
+            say("  no server answered: skipped")
+            continue
+        if kind != "polystrata":
+            use_server_model(e["url"], key)
+        else:
+            global REQUEST_MODEL
+            REQUEST_MODEL = "strata"
+        try:
+            res, d = bench_server(e["url"], key, None, a, say, redactor(key=key), False, None, gpu_hint=e.get("gpu"), label=e["name"])
+        except Exception as ex:                          # noqa: BLE001  one seat failing never stops the rest
+            rows.append({"name": e["name"], "error": repr(ex)[:120]})
+            continue
+        rows.append({"name": e["name"], "server": res["machine"].get("server"), "model": res["machine"].get("model"),
+                     "metrics": summary_metrics(res["results"]), "failed": len(res["results"]["failures"]),
+                     "report": d.name})
+        (fdir / "fleet.json").write_text(json.dumps(rows, indent=1, ensure_ascii=False), encoding="utf-8")
+    table = fleet_table(rows)
+    (fdir / "FLEET.md").write_text(
+        f"# Fleet benchmark {datetime.date.today().isoformat()}\n\nThe same `tools/strata_bench.py` suite against every seat, "
+        f"one seat at a time ({a.runs} runs per test, medians, thinking {'on' if a.think else 'off'}). Cold = the first request "
+        f"of the run; it is cold only if the server had just loaded.\n\n{table}\n", encoding="utf-8")
+    (fdir / "fleet.json").write_text(json.dumps(rows, indent=1, ensure_ascii=False), encoding="utf-8")
+    say("\n" + table + f"\n\nFleet report: {fdir / 'FLEET.md'}")
+    return 0 if any(not r.get("error") for r in rows) else 1
 
 if __name__ == "__main__":
     sys.exit(main())
