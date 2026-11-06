@@ -54,11 +54,17 @@ private:
     };
 
     void attention(Block& B, int64_t pos, int n);
+    /// Rows [first, first + n) of layer il's latent cache, as this card just wrote or loaded them, to the copies of
+    /// it on the cards after this one (their readers of layer il's cache), on this card's stream.
+    void push_kv_copies(int il, int64_t first, int64_t n);
     void indexer(Block& B, int64_t pos, int n);
     void dense_ffn(Block& B, int il, int n);
     int dense_rows(int64_t pos, int n) const;
 
     std::vector<Block> blocks_;   ///< one a layer of layers_
+    /// By layer: this card's copy of a latent cache that a layer here reads and an earlier card owns (else null).
+    /// The owning card fills it (push_kv_copies()), so a layer split may cut between a cache and its readers.
+    std::vector<uint16_t*> kv_copy_;
     std::vector<ml4::LayerPlan> plan_;
 
     int n_head_ = 0, kv_rank_ = 0, mla_k_ = 0, mla_v_ = 0, n_rot_ = 0, row_ = 0;

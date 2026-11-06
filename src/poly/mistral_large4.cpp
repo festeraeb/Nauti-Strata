@@ -223,6 +223,7 @@ int MistralLarge4::widest() const {
 // ring for every layer that scores.
 void MistralLarge4::alloc_caches() {
     ring_ = rows_ + kPool;
+    kv_copy_.assign(blocks_.size(), nullptr);
     const size_t ring_n = (size_t) ring_ * 2 * idx_dim_;
     float* ring = n_full_ ? (float*) seq_alloc(n_full_ * ring_n * sizeof(float), "the indexer cache") : nullptr;
     for (int il = 0; il < (int) blocks_.size(); ++il) {
@@ -231,10 +232,23 @@ void MistralLarge4::alloc_caches() {
         if (B.plan.owns_kv) {
             B.lat = (uint16_t*) kv_alloc((size_t) row_ * sizeof(uint16_t), 1);
         } else {
-            const Block& S = blocks_[(size_t) B.plan.kv_source];
-            if (!S.lat) throw std::runtime_error("layer " + std::to_string(il) + " reads the cache of layer " +
-                                                 std::to_string(B.plan.kv_source) + ", which is on another card");
-            B.lat = S.lat;
+            const int src = B.plan.kv_source;
+            const Block& S = blocks_[(size_t) src];
+            if (S.lat) {
+                B.lat = S.lat;
+            } else {
+                // The source layer is on an earlier card: a whole copy of its cache here (rows * row_ fp16, 38 MB
+                // at 32K), which that card fills as it writes (push_kv_copies()).  Whole, not grown, so a push
+                // never lands on rows this card has not mapped; seq_alloc() so every sequence has its own and
+                // copy_seq() takes it along.
+                if (src < 0 || src >= il)
+                    throw std::runtime_error("layer " + std::to_string(il) + " reads the cache of layer " +
+                                             std::to_string(src) + ", which is not on this card or an earlier one");
+                if (!kv_copy_[(size_t) src])
+                    kv_copy_[(size_t) src] = (uint16_t*) seq_alloc(
+                        (size_t) opt_.max_context * row_ * sizeof(uint16_t), "a copy of another card's attention cache");
+                B.lat = kv_copy_[(size_t) src];
+            }
         }
         if (B.plan.indexer_full) {
             B.pool = (float*) kv_alloc((size_t) idx_dim_ * sizeof(float), kPool);
@@ -246,6 +260,19 @@ void MistralLarge4::alloc_caches() {
     score_rows_ = (int) std::clamp<size_t>(kScoreBytes / (score_stride_ * sizeof(float)), 1, (size_t) rows_);
     sel_stride_ = idx_top_k_ + kPool;
     if (!sel_) sel_ = (int32_t*) dmalloc((size_t) rows_ * sel_stride_ * sizeof(int32_t), "scratch");
+}
+
+void MistralLarge4::push_kv_copies(int il, int64_t first, int64_t n) {
+    if (n <= 0) return;
+    const Block& S = blocks_[(size_t) il];
+    const size_t bytes = (size_t) row_ * sizeof(uint16_t);
+    // every card of a Mistral Large 4 chain is one (a protected member is reached through the derived type)
+    for (auto* m = dynamic_cast<MistralLarge4*>(next_.get()); m; m = dynamic_cast<MistralLarge4*>(m->next_.get())) {
+        if ((size_t) il >= m->kv_copy_.size() || !m->kv_copy_[(size_t) il]) continue;
+        ck(cudaMemcpyPeerAsync(m->kv_copy_[(size_t) il] + (size_t) first * row_, m->device_,
+                               S.lat + (size_t) first * row_, device_, (size_t) n * bytes, cs(st_)),
+           "a copy of the attention cache to a later card");
+    }
 }
 
 // No recurrent state and no pools in progress: a layer's state is its cache rows, which are card rows.
@@ -290,6 +317,7 @@ void MistralLarge4::load_card_rows(const uint8_t* src, int64_t from, int64_t cou
                           cudaMemcpyHostToDevice),
                "load rows");
             src += all * lat;
+            push_kv_copies((int) (&B - blocks_.data()), first, n);
         }
         if (B.plan.indexer_full && B.pool) {
             ck(cudaMemcpy((uint8_t*) B.pool + (size_t) first * key, src + skip * key, (size_t) n * key,
@@ -298,6 +326,7 @@ void MistralLarge4::load_card_rows(const uint8_t* src, int64_t from, int64_t cou
             src += all * key;
         }
     }
+    ck(cudaStreamSynchronize(cs(st_)), "load rows");   // the copies on later cards (push_kv_copies())
 }
 
 // While a token sees top_k tokens or fewer, every one is chosen and its attention is plain causal attention.  That
@@ -405,6 +434,7 @@ void MistralLarge4::attention(Block& B, int64_t pos, int n) {
             zero_cols(kr_ + kv_rank_, (size_t) row_, (size_t) n_rot_, (size_t) n, st_);
         }
         store_f16(kr_, B.lat, row_, pos, n, st_);
+        push_kv_copies((int) (&B - blocks_.data()), pos, n);
     }
 
     // the attention over the chosen rows: a prompt batch's tokens share their products, a few tokens get one each
