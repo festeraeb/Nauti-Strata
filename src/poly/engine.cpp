@@ -1024,6 +1024,11 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
         starts = layer_starts(o.layer_split, file, (int) blocks->u - (nextn ? (int) nextn->u : 0), cards);
         ck(cudaSetDevice(was), "cudaSetDevice");
     }
+    // the tier files of another split (or of one card) are no use to this load and take its disk
+    if (!o.expert_tier.empty() && o.expert_tier_mib > 0)
+        if (const uint64_t gone = ExpertTier::drop_stale(o.expert_tier, starts))
+            std::fprintf(stderr, "expert tiers: removed %llu MiB of tier files this layer split does not use\n",
+                         (unsigned long long) (gone >> 20));
     if (starts.empty()) {
         std::unique_ptr<Engine> engine = make();
         engine->load(o);

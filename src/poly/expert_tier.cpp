@@ -52,6 +52,33 @@ uint64_t ExpertTier::id_of(const std::string& s) {
     return h;
 }
 
+bool ExpertTier::stale(const std::string& name, const std::string& base, const std::vector<int>& starts) {
+    const bool split = !starts.empty();
+    if (name == base) return split;
+    const std::string pre = base + ".L";
+    if (name.size() <= pre.size() || name.compare(0, pre.size(), pre) != 0) return false;
+    const std::string n = name.substr(pre.size());
+    if (n.size() > 6 || n.find_first_not_of("0123456789") != std::string::npos) return false;   // not ours
+    return !split || std::find(starts.begin(), starts.end(), std::stoi(n)) == starts.end();
+}
+
+uint64_t ExpertTier::drop_stale(const std::string& path, const std::vector<int>& starts) {
+    namespace fs = std::filesystem;
+    const fs::path p(path);
+    const std::string base = p.filename().string();
+    if (base.empty()) return 0;
+    std::error_code ec;
+    uint64_t gone = 0;
+    for (fs::directory_iterator it(p.has_parent_path() ? p.parent_path() : fs::path("."), ec), end; !ec && it != end;
+         it.increment(ec)) {
+        if (!it->is_regular_file(ec) || !stale(it->path().filename().string(), base, starts)) continue;
+        const uint64_t bytes = (uint64_t) it->file_size(ec);
+        if (!ec && fs::remove(it->path(), ec)) gone += bytes;
+        ec.clear();
+    }
+    return gone;
+}
+
 ExpertTier::Room ExpertTier::room(uint64_t capacity, uint64_t meta_bytes, uint64_t free_bytes, uint64_t old_bytes) {
     const uint64_t total = free_bytes + old_bytes;
     Room r{};

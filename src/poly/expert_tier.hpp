@@ -69,6 +69,15 @@ public:
     };
     static Room room(uint64_t capacity, uint64_t meta_bytes, uint64_t free_bytes, uint64_t old_bytes);
 
+    /// Whether the file `name` in the tier's directory is a tier of `base` (the tier path's file name) that this
+    /// load does not use: on a split, "<base>.L<n>" for an n no card starts at, and "<base>" itself; on one card,
+    /// every "<base>.L<n>".  A changed split names its files by its own first layers, so the old split's files
+    /// would otherwise sit beside them and fill the disk (c4's Optane, 2026-11-06).  Other names are never stale.
+    static bool stale(const std::string& name, const std::string& base, const std::vector<int>& starts);
+    /// Removes the stale tiers of `path` (stale()), returning how many bytes went.  Errors are skipped: a tier is
+    /// a cache, and one that cannot be removed only costs the room it takes.
+    static uint64_t drop_stale(const std::string& path, const std::vector<int>& starts);
+
     /// Writes the tier file at `path`: the experts of `order`, hottest first, as many whole ones as fit in
     /// `capacity` bytes of expert data (the header and entries come on top), less if the filesystem holds less (see
     /// room()).  The file is written as path + ".tmp"

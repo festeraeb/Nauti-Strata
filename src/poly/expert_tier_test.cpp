@@ -239,11 +239,36 @@ void test_room() {
     check(r.capacity == 0, "less room than the header: nothing fits");
 }
 
+// A changed split leaves the old split's tier files (c4: .L12/.L24/.L35, 11.3 GB of a 13.4 GB Optane, so the new
+// split's .L13/.L34/.L53 got 11, 0 and 0 experts, 2026-11-06).
+void test_stale(const std::string& top) {
+    const std::string dir = top + "/stale";
+    std::filesystem::create_directories(dir);
+    const std::vector<int> split{0, 13, 34, 53};
+    check(ExpertTier::stale("t.L12", "t", split), "an old split's file is stale");
+    check(!ExpertTier::stale("t.L13", "t", split), "this split's file is not");
+    check(ExpertTier::stale("t", "t", split), "the one-card file is stale on a split");
+    check(!ExpertTier::stale("t", "t", {}), "the one-card file is not stale on one card");
+    check(ExpertTier::stale("t.L13", "t", {}), "every split file is stale on one card");
+    for (const char* n : {"t.L13.tmp", "t.Lx", "t.L", "u.L12", "tt.L12", "t.L1234567"})
+        check(!ExpertTier::stale(n, "t", split), std::string("not a tier of t: ") + n);
+    for (const char* n : {"t", "t.L0", "t.L12", "t.L13", "t.L13.tmp", "u.L12"}) {
+        FILE* f = std::fopen((dir + "/" + n).c_str(), "wb");
+        std::fputs("abcd", f);
+        std::fclose(f);
+    }
+    check(ExpertTier::drop_stale(dir + "/t", split) == 8, "drop_stale removes the two stale files' bytes");
+    for (const char* n : {"t.L0", "t.L13", "t.L13.tmp", "u.L12"})
+        check(std::filesystem::exists(dir + "/" + n), std::string("kept: ") + n);
+    for (const char* n : {"t", "t.L12"}) check(!std::filesystem::exists(dir + "/" + n), std::string("gone: ") + n);
+}
+
 int main() {
     const std::string dir = tmpdir();
     try {
         test_ids();
         test_room();
+        test_stale(dir);
         test_write_and_find(dir);
         test_edges(dir);
     } catch (const std::exception& e) {
