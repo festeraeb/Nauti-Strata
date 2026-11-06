@@ -204,8 +204,10 @@ void MistralLarge4::assign_scratch() {
     ik_ = fbuf(n * idx_dim_);
     ig_ = fbuf(n * idx_dim_);
     ape_ = fbuf((size_t) idx_dim_);
-    zero_vram(ig_, n * idx_dim_ * sizeof(float));   // a pool of one token has no gate: its key is the token's
-    zero_vram(ape_, (size_t) idx_dim_ * sizeof(float));
+    if (scratch_) {   // the first pass only counts (Engine::alloc()); the second has the VRAM
+        zero_vram(ig_, n * idx_dim_ * sizeof(float));   // a pool of one token has no gate: its key is the token's
+        zero_vram(ape_, (size_t) idx_dim_ * sizeof(float));
+    }
     score_ = fbuf((size_t) score_rows_ * score_stride_);
     const size_t keys = (size_t) std::min(opt_.max_context, idx_top_k_ + kPool - 1);
     akeys_n_ = std::min(n, (size_t) kAttnRows) * keys * row_;
