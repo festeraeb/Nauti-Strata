@@ -2308,6 +2308,26 @@ void Engine::router_scores(const Layer& L, int n) { lin(L.gate_inp, xn_, rl_, n,
 bool Engine::batched(const Layer& L, int n) const { return mmq_ && L.mmq && n >= kStageRows; }
 
 // The router's scores, and the copies of them and of the experts' input to the host.
+// Starts the kernel reading a missed expert's bytes before the layer touches them: one hint over each of its gate,
+// up and down, so a file-backed expert arrives in large read-ahead requests instead of one page fault at a time
+// from the compute threads.  On c4 (the model over NFS) the faults were ~25 KiB each with 58 of 60 threads waiting
+// on them (2026-11-06).  RAM-tier and VRAM experts are skipped by the callers; a hint on resident pages costs little.
+static void will_need_expert(const TierSpan& s, size_t gu_bytes, size_t d_bytes) {
+#if defined(__linux__)
+    const uintptr_t pg = 4096;
+    auto hint = [&](const uint8_t* p, size_t n) {
+        if (!p || !n) return;
+        const uintptr_t a = (uintptr_t) p & ~(pg - 1);
+        (void) madvise((void*) a, (size_t) ((uintptr_t) p + n - a), MADV_WILLNEED);
+    };
+    hint(s.gate, gu_bytes);
+    hint(s.up, gu_bytes);
+    hint(s.down, d_bytes);
+#else
+    (void) s; (void) gu_bytes; (void) d_bytes;
+#endif
+}
+
 void Engine::moe_router(const Layer& L, int n) {
     router_scores(L, n);
     copy2(rl_, h_rl_, n * n_expert_, xn_, h_x_, n * n_embd_, st_);
@@ -2354,6 +2374,11 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                 host[n_host++] = {L.src[(size_t) e].gate, L.src[(size_t) e].up,
                                   L.src[(size_t) e].down, w[k], t};
             }
+        }
+        for (int i = 0; i < n_host; ++i) {   // each missed expert's bytes start reading once, in routing order
+            bool seen = false;
+            for (int j = 0; j < i && !seen; ++j) seen = host_e[j] == host_e[i];
+            if (!seen) will_need_expert(L.src[(size_t) host_e[i]], L.gu_bytes, L.d_bytes);
         }
         // Strata's STRATA_ROUTE_TAIL_SKIP: an expert outside VRAM that every token here ranks at tail_skip or later
         // adds little to any of them, so it is not computed.  The others keep the weights the router gave them.
@@ -2652,6 +2677,15 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     bounds[n_group] = at;
     const int rg = at;   // the card's rows
     host_.clear();
+    {   // every missed expert of the layer starts reading now, before staging or the CPU take it
+        std::vector<uint8_t> hinted((size_t) n_expert_, 0);
+        for (int i = 0; i < rr; ++i) {
+            const size_t e = (size_t) ids_[(size_t) i];
+            if (e >= (size_t) n_expert_ || hinted[e] || L.slot[e]) continue;
+            hinted[e] = 1;
+            will_need_expert(L.src[e], L.gu_bytes, L.d_bytes);
+        }
+    }
     for (int i = 0; i < rr; ++i) {
         const size_t e = (size_t) ids_[(size_t) i];
         if (on_cpu_[e]) {   // by token, as cpu_experts() takes them, and nothing of it in the card's sum
