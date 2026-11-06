@@ -1915,7 +1915,9 @@ std::vector<std::pair<int32_t, int32_t>> Engine::tier_order(const std::vector<in
             cands.push_back({il, e, used / bytes});
         }
     }
-    std::stable_sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.value > b.value; });
+    // the same order as fill_expert_cache(): by value, among equals the lower expert index first
+    std::stable_sort(cands.begin(), cands.end(),
+                     [](const Cand& a, const Cand& b) { return a.value != b.value ? a.value > b.value : a.e < b.e; });
     // the next load fills VRAM with the warmest by these counts (fill_expert_cache()), as many as it holds now
     if (next_load) cands.erase(cands.begin(), cands.begin() + (ptrdiff_t) std::min(in_vram, cands.size()));
     std::vector<std::pair<int32_t, int32_t>> order;
