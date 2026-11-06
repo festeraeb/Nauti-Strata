@@ -1892,6 +1892,23 @@ void Engine::alloc() {
     use_.assign(layers_.size() * n_expert_, 0);
 }
 
+// On a layer split every card's engine builds tiers for its own layers: the budgets are its share of the MoE
+// layers, and the tier file is its own (path + ".L<first layer>"), so that the engines do not take the whole RAM
+// budget each or write over one another's file.
+double Engine::tier_share() const {
+    int mine = 0, all = 0;
+    for (int il = 0; il < (int) layers_.size(); ++il) {
+        if (!layers_[(size_t) il].moe) continue;
+        ++all;
+        if (runs(il)) ++mine;
+    }
+    return all ? (double) mine / all : 1.0;
+}
+
+std::string Engine::tier_path() const {
+    return split_ ? opt_.expert_tier + ".L" + std::to_string(lo_) : opt_.expert_tier;
+}
+
 // The experts outside VRAM, warmest first: by use per byte as fill_expert_cache() ranks them, among equals the
 // lower layer and expert first.
 std::vector<std::pair<int32_t, int32_t>> Engine::tier_order(const std::vector<int64_t>& counts, bool next_load) const {
@@ -1934,7 +1951,7 @@ std::vector<std::pair<int32_t, int32_t>> Engine::tier_want(const std::vector<int
     size_t from = 0;
     if (next_load) {   // the RAM tier of the next load: the warmest that fit, as build_tiers() takes them
         ram.clear();
-        const size_t capacity = (size_t) std::max(opt_.ram_experts_mib, 0) << 20;
+        const size_t capacity = (size_t) ((double) ((size_t) std::max(opt_.ram_experts_mib, 0) << 20) * tier_share());
         size_t used = 0;
         for (; from < order.size(); ++from) {
             const Layer& L = layers_[(size_t) order[from].first];
@@ -1943,7 +1960,7 @@ std::vector<std::pair<int32_t, int32_t>> Engine::tier_want(const std::vector<int
             used += bytes;
         }
     }
-    const uint64_t capacity = (uint64_t) opt_.expert_tier_mib << 20;
+    const uint64_t capacity = (uint64_t) ((double) ((uint64_t) opt_.expert_tier_mib << 20) * tier_share());
     uint64_t used = 0;
     for (size_t i = from; i < order.size(); ++i) {
         const auto& le = order[i];
@@ -1973,7 +1990,7 @@ void Engine::build_tiers() {
     size_t next = 0;
     ram_tier_set_.clear();
     if (opt_.ram_experts_mib > 0 && !order.empty()) {
-        const size_t capacity = (size_t) opt_.ram_experts_mib << 20;
+        const size_t capacity = (size_t) ((double) ((size_t) opt_.ram_experts_mib << 20) * tier_share());
         std::vector<std::pair<int32_t, int32_t>> take;
         size_t used = 0;
         for (; next < order.size(); ++next) {
@@ -2011,7 +2028,7 @@ void Engine::build_tiers() {
     bool reuse = false;
     std::string why;
     try {
-        tier_.open(opt_.expert_tier, model_id);
+        tier_.open(tier_path(), model_id);
         std::set<std::pair<int32_t, int32_t>> have;
         for (const ExpertTier::Entry& en : tier_.entries()) have.emplace(en.layer, en.expert);
         size_t hit = 0;
@@ -2023,7 +2040,7 @@ void Engine::build_tiers() {
     }
     if (!reuse) {
         tier_.close();
-        std::fprintf(stderr, "expert tiers: writing %s (%s)\n", opt_.expert_tier.c_str(), why.c_str());
+        std::fprintf(stderr, "expert tiers: writing %s (%s)\n", tier_path().c_str(), why.c_str());
         const auto t0 = Clock::now();
         ExpertTier::Fetch fetch = [&](int il, int e, TierSpan& span, uint64_t& gu, uint64_t& d) {
             const Layer& L = layers_[(size_t) il];
@@ -2034,9 +2051,9 @@ void Engine::build_tiers() {
             d = L.d_bytes;
             return true;
         };
-        const size_t n = ExpertTier::write(opt_.expert_tier, (uint32_t) layers_.size(), (uint32_t) n_expert_, model_id,
-                                           profile_id, want, fetch, (uint64_t) opt_.expert_tier_mib << 20);
-        tier_.open(opt_.expert_tier, model_id);
+        const size_t n = ExpertTier::write(tier_path(), (uint32_t) layers_.size(), (uint32_t) n_expert_, model_id,
+                                           profile_id, want, fetch, (uint64_t) ((double) ((uint64_t) opt_.expert_tier_mib << 20) * tier_share()));
+        tier_.open(tier_path(), model_id);
         std::fprintf(stderr, "expert tiers: wrote %zu experts (%llu MiB) in %.1f s\n", n,
                      (unsigned long long) (tier_.data_bytes() >> 20),
                      std::chrono::duration<double>(Clock::now() - t0).count());
@@ -2057,7 +2074,7 @@ void Engine::build_tiers() {
     }
     tier_.will_need();
     std::fprintf(stderr, "expert tiers: %lld experts (%llu MiB) read from %s\n", (long long) tier_experts_,
-                 (unsigned long long) (tier_.data_bytes() >> 20), opt_.expert_tier.c_str());
+                 (unsigned long long) (tier_.data_bytes() >> 20), tier_path().c_str());
 }
 
 void Engine::save_profile() const {
@@ -2094,7 +2111,7 @@ void Engine::save_profile() const {
     for (const auto& le : want) hit += have.count(le);
     if (want.empty() || hit * 10 >= want.size() * 9) return;
     std::fprintf(stderr, "expert tiers: the profile drifted (%zu of %zu wanted experts in the tier): rewriting %s\n",
-                 hit, want.size(), opt_.expert_tier.c_str());
+                 hit, want.size(), tier_path().c_str());
     ExpertTier::Fetch fetch = [&](int il, int e, TierSpan& span, uint64_t& gu, uint64_t& d) {
         const Layer& L = layers_[(size_t) il];
         if (!L.moe || e < 0 || e >= n_expert_) return false;
@@ -2104,8 +2121,8 @@ void Engine::save_profile() const {
         d = L.d_bytes;
         return true;
     };
-    ExpertTier::write(opt_.expert_tier, (uint32_t) layers_.size(), (uint32_t) n_expert_, tier_model_id(),
-                      ExpertTier::id_of(opt_.profile), want, fetch, (uint64_t) opt_.expert_tier_mib << 20);
+    ExpertTier::write(tier_path(), (uint32_t) layers_.size(), (uint32_t) n_expert_, tier_model_id(),
+                      ExpertTier::id_of(opt_.profile), want, fetch, (uint64_t) ((double) ((uint64_t) opt_.expert_tier_mib << 20) * tier_share()));
 }
 
 void Engine::reset() {

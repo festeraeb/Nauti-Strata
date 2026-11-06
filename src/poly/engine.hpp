@@ -451,6 +451,8 @@ protected:
     /// `next_load` the RAM tier too is the next load's: the warmest ram_experts_mib after VRAM's.
     std::vector<std::pair<int32_t, int32_t>> tier_want(const std::vector<int64_t>& counts, bool next_load) const;
     uint64_t tier_model_id() const;
+    double tier_share() const;      ///< this engine's share of the MoE layers: its part of the tier budgets
+    std::string tier_path() const;  ///< the tier file: on a split, one a card
     void build_tiers();
     void start_swaps();
     void plan_ahead(Layer& L, int il);
