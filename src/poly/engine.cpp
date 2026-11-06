@@ -26,6 +26,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 #include <exception>
 #include <filesystem>
 #include <new>
@@ -365,7 +368,12 @@ Engine::~Engine() {
     map_quit_.store(true);
     if (mapper_.joinable()) mapper_.join();
     tier_.close();
-    if (ram_tier_) std::free(ram_tier_);
+    if (ram_tier_) {
+#if defined(__linux__)
+        munlock(ram_tier_, ram_tier_bytes_);
+#endif
+        std::free(ram_tier_);
+    }
     ram_tier_ = nullptr;
     if (follower_.joinable()) {
         {
@@ -2003,6 +2011,14 @@ void Engine::build_tiers() {
             if (posix_memalign(&buf, 4096, used) != 0 || !buf)
                 throw std::runtime_error("cannot allocate " + std::to_string(used >> 20) + " MiB for the RAM expert tier");
             ram_tier_ = buf;
+#if defined(__linux__)
+            // Locked, so the kernel cannot swap it: on c4 (Omarchy zram swap) a 60 GiB tier, written once at load
+            // while 218 GB of model streamed through the page cache, went 59 GB to zram and every expert read
+            // faulted back 4 KB at a time (2026-11-06). Without the privilege it runs as before, with a warning.
+            if (mlock(buf, used) != 0)
+                std::fprintf(stderr, "expert tiers: cannot lock the RAM tier (%s); the kernel may swap it\n",
+                             std::strerror(errno));
+#endif
             ram_tier_bytes_ = used;
             uint8_t* at = (uint8_t*) buf;
             for (const auto& [il, e] : take) {
