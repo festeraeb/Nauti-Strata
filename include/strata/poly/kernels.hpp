@@ -308,5 +308,11 @@ void dsv4_attend(const float* q, const uint16_t* raw, int ring, int window, cons
                  float scale, int64_t pos, int rows, void* stream, const long long* at = nullptr, int room = 0);
 /// y[g][t] = x[t][g] for `rows` tokens of `groups` groups of n values; with back, y[t][g] = x[g][t].
 void permute_groups(const float* x, float* y, int n, int groups, int rows, bool back, void* stream);
+/// Mistral Large 4.  Turns the n_rot values from `off` of every head of every token in place: pairs (i, i + n_rot/2)
+/// with neox, (2i, 2i + 1) without; factors[i] (n_rot/2 of them, or null) divides pair i's angle.
+void rope_ext(float* x, int dim, int heads, int off, int n_rot, const Rope& r, const float* factors, bool neox,
+              int64_t pos, int rows, void* stream);
+/// SSMax: head h of the token at pos + t times s[h] * ln(pos + t + 1) + b[h].  rows tokens of heads heads of dim.
+void ssmax_scale(float* x, const float* s, const float* b, int dim, int heads, int64_t pos, int rows, void* stream);
 
 }  // namespace strata::poly

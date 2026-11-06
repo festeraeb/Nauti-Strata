@@ -3,6 +3,7 @@
 #include "engine.hpp"
 
 #include "deepseek4.hpp"
+#include "mistral_large4.hpp"
 #include "gemma4.hpp"
 #include "glm5next.hpp"
 #include "lfm2moe.hpp"
@@ -29,6 +30,7 @@
 #include <filesystem>
 #include <new>
 #include <numeric>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -362,6 +364,9 @@ Engine::~Engine() {
     OnCard here(device_, split_);
     map_quit_.store(true);
     if (mapper_.joinable()) mapper_.join();
+    tier_.close();
+    if (ram_tier_) std::free(ram_tier_);
+    ram_tier_ = nullptr;
     if (follower_.joinable()) {
         {
             std::lock_guard<std::mutex> l(swap_m_);
@@ -973,6 +978,10 @@ void Engine::load_moe(int il, bool shared) {
     if (!cpu_expert_types_ok((int) L.gu_type, (int) L.d_type, n_embd_, n_ff_exp_, err))
         throw std::runtime_error(blk(il, "ffn_*_exps.weight: ") + err);
     L.slot.assign((size_t) n_expert_, nullptr);
+    L.src.resize((size_t) n_expert_);
+    for (int e = 0; e < n_expert_; ++e)
+        L.src[(size_t) e] = TierSpan{L.exp_gate + (size_t) e * L.gu_stride, L.exp_up + (size_t) e * L.gu_stride,
+                                     L.exp_down + (size_t) e * L.d_bytes};
     ++n_moe_;
 }
 
@@ -988,6 +997,7 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
         if (name == "qwen35moe") return std::make_unique<Qwen35>();
         if (name == "gemma4") return std::make_unique<Gemma4>();
         if (name == "deepseek4") return std::make_unique<DeepSeek4>();
+        if (name == "mistral-large4") return std::make_unique<MistralLarge4>();
         if (name == "lfm2moe") return std::make_unique<Lfm2Moe>();
         throw std::runtime_error(o.model + " is a '" + name + "' model, which this engine does not run");
     };
@@ -1222,9 +1232,9 @@ void Engine::fill_expert_cache() {
         uint8_t* s = exp_ + exp_at_;
         exp_at_ += c.bytes;
         const size_t e = (size_t) c.e;
-        h2d(s, L.exp_gate + e * L.gu_stride, L.gu_bytes);
-        h2d(s + L.gu_bytes, L.exp_up + e * L.gu_stride, L.gu_bytes);
-        h2d(s + 2 * L.gu_bytes, L.exp_down + e * L.d_bytes, L.d_bytes);
+        h2d(s, L.src[(size_t) e].gate, L.gu_bytes);
+        h2d(s + L.gu_bytes, L.src[(size_t) e].up, L.gu_bytes);
+        h2d(s + 2 * L.gu_bytes, L.src[(size_t) e].down, L.d_bytes);
         L.slot[e] = s;
         ++cached_;
     }
@@ -1401,9 +1411,9 @@ int Engine::grow_cache(size_t bytes) {
         uint8_t* s = exp_ + exp_at_;
         exp_at_ += L.slot_bytes;
         const size_t e = (size_t) c.e;
-        h2d(s, L.exp_gate + e * L.gu_stride, L.gu_bytes);
-        h2d(s + L.gu_bytes, L.exp_up + e * L.gu_stride, L.gu_bytes);
-        h2d(s + 2 * L.gu_bytes, L.exp_down + e * L.d_bytes, L.d_bytes);
+        h2d(s, L.src[(size_t) e].gate, L.gu_bytes);
+        h2d(s + L.gu_bytes, L.src[(size_t) e].up, L.gu_bytes);
+        h2d(s + 2 * L.gu_bytes, L.src[(size_t) e].down, L.d_bytes);
         L.slot[e] = s;
         ++cached_;
     }
@@ -1441,9 +1451,9 @@ void Engine::follow_loop() {
         lk.unlock();
         const Layer& L = layers_[(size_t) s->il];
         const size_t e = (size_t) s->e, gu = L.gu_bytes;
-        std::memcpy(s->pinned, L.exp_gate + e * L.gu_stride, gu);
-        std::memcpy(s->pinned + gu, L.exp_up + e * L.gu_stride, gu);
-        std::memcpy(s->pinned + 2 * gu, L.exp_down + e * L.d_bytes, L.d_bytes);
+        std::memcpy(s->pinned, L.src[(size_t) e].gate, gu);
+        std::memcpy(s->pinned + gu, L.src[(size_t) e].up, gu);
+        std::memcpy(s->pinned + 2 * gu, L.src[(size_t) e].down, L.d_bytes);
         cudaError_t err = cudaMemcpyAsync(s->slot, s->pinned, 2 * gu + L.d_bytes, cudaMemcpyHostToDevice, cs(swap_st_));
         if (err == cudaSuccess) err = cudaEventRecord(s->done, cs(swap_st_));
         lk.lock();
@@ -1694,6 +1704,7 @@ void Engine::load(const Options& o) {
             }
         }
     }
+    build_tiers();
     const int threads = opt_.threads > 0 ? opt_.threads : usable_cpus();
     mind_memory();
     std::vector<std::pair<const uint8_t*, size_t>> spans;   // the routed experts in the mapped files
@@ -1881,6 +1892,152 @@ void Engine::alloc() {
     use_.assign(layers_.size() * n_expert_, 0);
 }
 
+// The experts outside VRAM, warmest first: by use per byte as fill_expert_cache() ranks them, among equals the
+// lower layer and expert first.
+std::vector<std::pair<int32_t, int32_t>> Engine::tier_order(const std::vector<int64_t>& counts) const {
+    struct Cand {
+        int il, e;
+        double value;
+    };
+    std::vector<Cand> cands;
+    for (int il = 0; il < (int) layers_.size(); ++il) {
+        const Layer& L = layers_[(size_t) il];
+        if (!L.moe || !runs(il)) continue;
+        const double bytes = (double) (2 * L.gu_bytes + L.d_bytes);
+        for (int e = 0; e < n_expert_; ++e) {
+            if (L.slot[(size_t) e]) continue;   // in VRAM
+            const size_t i = (size_t) il * n_expert_ + e;
+            const double used = (double) (i < counts.size() ? counts[i] : 0);
+            cands.push_back({il, e, used / bytes});
+        }
+    }
+    std::stable_sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.value > b.value; });
+    std::vector<std::pair<int32_t, int32_t>> order;
+    order.reserve(cands.size());
+    for (const Cand& c : cands) order.emplace_back(c.il, c.e);
+    return order;
+}
+
+std::vector<std::pair<int32_t, int32_t>> Engine::tier_want(const std::vector<int64_t>& counts) const {
+    std::vector<std::pair<int32_t, int32_t>> want;
+    if (opt_.expert_tier.empty() || opt_.expert_tier_mib <= 0) return want;
+    std::set<std::pair<int32_t, int32_t>> ram(ram_tier_set_.begin(), ram_tier_set_.end());
+    const uint64_t capacity = (uint64_t) opt_.expert_tier_mib << 20;
+    uint64_t used = 0;
+    for (const auto& le : tier_order(counts)) {
+        if (ram.count(le)) continue;
+        const Layer& L = layers_[(size_t) le.first];
+        const uint64_t bytes = 2 * L.gu_bytes + L.d_bytes;
+        if (used + bytes > capacity) continue;
+        want.push_back(le);
+        used += bytes;
+    }
+    return want;
+}
+
+// What names the model to the tier file: its path, its bytes and its shape.
+uint64_t Engine::tier_model_id() const {
+    return ExpertTier::id_of(opt_.model + "|" + std::to_string(gg_->bytes()) + "|" + std::to_string(layers_.size()) +
+                             "|" + std::to_string(n_expert_) + "|" + std::to_string(n_ff_exp_));
+}
+
+// The RAM tier, then the tier file, from the counts the cache was filled by (the profile's and this run's).  The
+// tier file is reused when it is this model's and holds at least nine tenths of what the counts ask for now, and
+// written otherwise.  An expert's src then points into RAM, into the mapped file, or stays in the model's file.
+void Engine::build_tiers() {
+    std::vector<int64_t> counts(use_.size(), 0);
+    for (size_t i = 0; i < counts.size(); ++i) counts[i] = (i < prior_.size() ? prior_[i] : 0) + use_[i];
+    std::vector<std::pair<int32_t, int32_t>> order = tier_order(counts);
+    size_t next = 0;
+    ram_tier_set_.clear();
+    if (opt_.ram_experts_mib > 0 && !order.empty()) {
+        const size_t capacity = (size_t) opt_.ram_experts_mib << 20;
+        std::vector<std::pair<int32_t, int32_t>> take;
+        size_t used = 0;
+        for (; next < order.size(); ++next) {
+            const Layer& L = layers_[(size_t) order[next].first];
+            const size_t bytes = 2 * L.gu_bytes + L.d_bytes;
+            if (used + bytes > capacity) break;   // in heat order: stop at the first that does not fit
+            take.push_back(order[next]);
+            used += bytes;
+        }
+        if (used) {
+            void* buf = nullptr;
+            if (posix_memalign(&buf, 4096, used) != 0 || !buf)
+                throw std::runtime_error("cannot allocate " + std::to_string(used >> 20) + " MiB for the RAM expert tier");
+            ram_tier_ = buf;
+            ram_tier_bytes_ = used;
+            uint8_t* at = (uint8_t*) buf;
+            for (const auto& [il, e] : take) {
+                Layer& L = layers_[(size_t) il];
+                TierSpan& src = L.src[(size_t) e];
+                std::memcpy(at, src.gate, L.gu_bytes);
+                std::memcpy(at + L.gu_bytes, src.up, L.gu_bytes);
+                std::memcpy(at + 2 * L.gu_bytes, src.down, L.d_bytes);
+                src = TierSpan{at, at + L.gu_bytes, at + 2 * L.gu_bytes};
+                at += 2 * L.gu_bytes + L.d_bytes;
+            }
+            ram_tier_set_ = take;
+            ram_experts_ = (int64_t) take.size();
+            std::fprintf(stderr, "expert tiers: %lld experts (%zu MiB) in RAM\n", (long long) ram_experts_, used >> 20);
+        }
+    }
+    if (opt_.expert_tier.empty() || opt_.expert_tier_mib <= 0) return;
+    const std::vector<std::pair<int32_t, int32_t>> want = tier_want(counts);
+    const uint64_t model_id = tier_model_id();
+    const uint64_t profile_id = ExpertTier::id_of(opt_.profile);
+    bool reuse = false;
+    std::string why;
+    try {
+        tier_.open(opt_.expert_tier, model_id);
+        std::set<std::pair<int32_t, int32_t>> have;
+        for (const ExpertTier::Entry& en : tier_.entries()) have.emplace(en.layer, en.expert);
+        size_t hit = 0;
+        for (const auto& le : want) hit += have.count(le);
+        reuse = !want.empty() && hit * 10 >= want.size() * 9;
+        if (!reuse) why = std::to_string(hit) + " of the " + std::to_string(want.size()) + " experts wanted";
+    } catch (const std::exception& e) {
+        why = e.what();
+    }
+    if (!reuse) {
+        tier_.close();
+        std::fprintf(stderr, "expert tiers: writing %s (%s)\n", opt_.expert_tier.c_str(), why.c_str());
+        const auto t0 = Clock::now();
+        ExpertTier::Fetch fetch = [&](int il, int e, TierSpan& span, uint64_t& gu, uint64_t& d) {
+            const Layer& L = layers_[(size_t) il];
+            if (!L.moe || e < 0 || e >= n_expert_) return false;
+            span = TierSpan{L.exp_gate + (size_t) e * L.gu_stride, L.exp_up + (size_t) e * L.gu_stride,
+                            L.exp_down + (size_t) e * L.d_bytes};
+            gu = L.gu_bytes;
+            d = L.d_bytes;
+            return true;
+        };
+        const size_t n = ExpertTier::write(opt_.expert_tier, (uint32_t) layers_.size(), (uint32_t) n_expert_, model_id,
+                                           profile_id, want, fetch, (uint64_t) opt_.expert_tier_mib << 20);
+        tier_.open(opt_.expert_tier, model_id);
+        std::fprintf(stderr, "expert tiers: wrote %zu experts (%llu MiB) in %.1f s\n", n,
+                     (unsigned long long) (tier_.data_bytes() >> 20),
+                     std::chrono::duration<double>(Clock::now() - t0).count());
+    }
+    tier_experts_ = 0;
+    for (const ExpertTier::Entry& en : tier_.entries()) {
+        if (!runs(en.layer)) continue;
+        Layer& L = layers_[(size_t) en.layer];
+        if (!L.moe || L.slot[(size_t) en.expert]) continue;
+        if (en.gu_bytes != L.gu_bytes || en.d_bytes != L.d_bytes) continue;   // another quantization's tier
+        TierSpan span;
+        if (!tier_.find(en.layer, en.expert, span)) continue;
+        bool in_ram = false;
+        for (const auto& le : ram_tier_set_) in_ram = in_ram || (le.first == en.layer && le.second == en.expert);
+        if (in_ram) continue;
+        L.src[(size_t) en.expert] = span;
+        ++tier_experts_;
+    }
+    tier_.will_need();
+    std::fprintf(stderr, "expert tiers: %lld experts (%llu MiB) read from %s\n", (long long) tier_experts_,
+                 (unsigned long long) (tier_.data_bytes() >> 20), opt_.expert_tier.c_str());
+}
+
 void Engine::save_profile() const {
     if (opt_.profile.empty()) return;
     const std::string tmp = opt_.profile + ".tmp";
@@ -1904,6 +2061,29 @@ void Engine::save_profile() const {
     std::error_code ec;
     if (written) std::filesystem::rename(tmp, opt_.profile, ec);   // std::rename replaces no file on Windows
     if (!written || ec) throw std::runtime_error("cannot write " + opt_.profile);
+
+    // The tier file follows the profile: when the counts now ask for a set that the file holds less than nine
+    // tenths of, it is written again for the next load (this run keeps reading the mapping it has).
+    if (opt_.expert_tier.empty() || opt_.expert_tier_mib <= 0 || !tier_.mapped()) return;
+    const std::vector<std::pair<int32_t, int32_t>> want = tier_want(all);
+    std::set<std::pair<int32_t, int32_t>> have;
+    for (const ExpertTier::Entry& en : tier_.entries()) have.emplace(en.layer, en.expert);
+    size_t hit = 0;
+    for (const auto& le : want) hit += have.count(le);
+    if (want.empty() || hit * 10 >= want.size() * 9) return;
+    std::fprintf(stderr, "expert tiers: the profile drifted (%zu of %zu wanted experts in the tier): rewriting %s\n",
+                 hit, want.size(), opt_.expert_tier.c_str());
+    ExpertTier::Fetch fetch = [&](int il, int e, TierSpan& span, uint64_t& gu, uint64_t& d) {
+        const Layer& L = layers_[(size_t) il];
+        if (!L.moe || e < 0 || e >= n_expert_) return false;
+        span = TierSpan{L.exp_gate + (size_t) e * L.gu_stride, L.exp_up + (size_t) e * L.gu_stride,
+                        L.exp_down + (size_t) e * L.d_bytes};
+        gu = L.gu_bytes;
+        d = L.d_bytes;
+        return true;
+    };
+    ExpertTier::write(opt_.expert_tier, (uint32_t) layers_.size(), (uint32_t) n_expert_, tier_model_id(),
+                      ExpertTier::id_of(opt_.profile), want, fetch, (uint64_t) opt_.expert_tier_mib << 20);
 }
 
 void Engine::reset() {
@@ -2104,8 +2284,8 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                 }
                 host_e[n_host] = (int32_t) e;
                 host_k[n_host] = k;
-                host[n_host++] = {L.exp_gate + e * L.gu_stride, L.exp_up + e * L.gu_stride,
-                                  L.exp_down + e * L.d_bytes, w[k], t};
+                host[n_host++] = {L.src[(size_t) e].gate, L.src[(size_t) e].up,
+                                  L.src[(size_t) e].down, w[k], t};
             }
         }
         // Strata's STRATA_ROUTE_TAIL_SKIP: an expert outside VRAM that every token here ranks at tail_skip or later
@@ -2252,9 +2432,9 @@ void Engine::stage(const Layer& L, const int32_t* experts, int m, void* stream, 
         ck(cudaEventSynchronize(left), "expert staging");
         const auto copy = [&](int i) {
             const size_t j = (size_t) i / 3, e = (size_t) experts[(size_t) j0 + j];
-            if (i % 3 == 0) std::memcpy(h + j * gu2, L.exp_gate + e * L.gu_stride, L.gu_bytes);
-            else if (i % 3 == 1) std::memcpy(h + j * gu2 + L.gu_bytes, L.exp_up + e * L.gu_stride, L.gu_bytes);
-            else std::memcpy(h + c * gu2 + j * L.d_bytes, L.exp_down + e * L.d_bytes, L.d_bytes);
+            if (i % 3 == 0) std::memcpy(h + j * gu2, L.src[(size_t) e].gate, L.gu_bytes);
+            else if (i % 3 == 1) std::memcpy(h + j * gu2 + L.gu_bytes, L.src[(size_t) e].up, L.gu_bytes);
+            else std::memcpy(h + c * gu2 + j * L.d_bytes, L.src[(size_t) e].down, L.d_bytes);
         };
         (alone ? *stagers_ : *workers_).run((int) (3 * c), copy);
         ck(cudaMemcpyAsync(stage_ + (size_t) j0 * gu2, h, c * gu2, cudaMemcpyHostToDevice, cs(stream)),
@@ -2408,7 +2588,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     for (int i = 0; i < rr; ++i) {
         const size_t e = (size_t) ids_[(size_t) i];
         if (on_cpu_[e]) {   // by token, as cpu_experts() takes them, and nothing of it in the card's sum
-            host_.push_back({L.exp_gate + e * L.gu_stride, L.exp_up + e * L.gu_stride, L.exp_down + e * L.d_bytes,
+            host_.push_back({L.src[(size_t) e].gate, L.src[(size_t) e].up, L.src[(size_t) e].down,
                              w[i], i / n_used_});
             w[i] = 0.f;
             continue;

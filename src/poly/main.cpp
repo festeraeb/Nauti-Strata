@@ -1083,6 +1083,11 @@ void usage() {
                  "  --top-probs N          with --tokens: print the N most likely ids of every step to stderr\n"
                  "  --follow ID,ID,...     with --tokens: write these tokens in place of the ones picked, for\n"
                  "                         --top-probs of the same answer under other settings\n"
+                 "  --ram-experts-mib N    copy the warmest experts outside VRAM into N MiB of RAM (default: none)\n"
+                 "  --expert-tier FILE     a file on a fast local disk that holds the next warmest experts in heat\n"
+                 "                         order, mmapped; the engine writes it from --expert-profile and rewrites\n"
+                 "                         it when the profile drifts\n"
+                 "  --expert-tier-mib N    the experts' bytes that file holds at most\n"
                  "  --tail-skip N          an expert outside VRAM that every token of a window ranks at place N+1\n"
                  "                         or later among its experts is left out: faster, and the answers move a\n"
                  "                         little (default 0 = none is; setup gives Qwen3.6 6)\n"
@@ -1147,6 +1152,9 @@ int main(int argc, char** argv) {
         else if (a == "--draft-model") o.draft_model = val();
         else if (a == "--expert-swaps") o.expert_swaps = std::atoi(val());
         else if (a == "--tail-skip") o.tail_skip = std::atoi(val());
+        else if (a == "--ram-experts-mib") o.ram_experts_mib = std::atoi(val());
+        else if (a == "--expert-tier") o.expert_tier = val();
+        else if (a == "--expert-tier-mib") o.expert_tier_mib = std::atoi(val());
         else if (a == "--layer-split") o.layer_split = val();
         else if (a == "--batch" || a == "--slots") o.batch = std::atoi(val());
         else if (a == "--check-batch") check = std::atoi(val());

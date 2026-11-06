@@ -15,6 +15,7 @@
 #pragma once
 
 #include "cpu_experts.hpp"
+#include "expert_tier.hpp"
 
 #include <condition_variable>
 #include <cstddef>
@@ -83,6 +84,12 @@ struct Options {
                                   ///< empty, or one device: the current card alone
     int batch = 0;                ///< sequences beside the first, each with a state and caches of its own (bind(),
                                   ///< step()); 0: one sequence
+    // The expert tiers below VRAM (build_tiers()): the next warmest experts by the profile copied into RAM, then
+    // the next into one heat-ordered file on a fast local device (the Optane module), mmapped; the rest stay in the
+    // model's file.  The engine writes the tier file and rewrites it when the profile has drifted (save_profile()).
+    int ram_experts_mib = 0;      ///< RAM for the warm experts; 0: none
+    std::string expert_tier;      ///< the tier file; empty: none
+    int expert_tier_mib = 0;      ///< the experts' bytes it holds at most
 };
 
 /// A thing a model's file may call by other names than the engine does: converters differ.
@@ -114,6 +121,7 @@ struct Layer {
     size_t gu_bytes = 0, d_bytes = 0;  ///< one expert's gate (or up), and its down
     size_t gu_stride = 0;              ///< from an expert's gate to the next one's: twice gu_bytes in a file that
                                        ///< keeps an expert's gate and up in one tensor
+    std::vector<TierSpan> src;         ///< per expert: where its bytes are read from (the file, RAM or the tier)
     std::vector<uint8_t*> slot;        ///< per expert: gate | up | down in VRAM, or null
     size_t slot_bytes = 0;             ///< from a slot of the layer to the one behind it: whole blocks of both types
     std::vector<int32_t> ahead;        ///< experts a full prompt batch stages before it routes
@@ -435,6 +443,12 @@ protected:
     bool input(int32_t token, int64_t row, float* dst) const;
     void lin(const Dev& w, const float* x, float* y, int n, const void* xq = nullptr, int rows_per_x = 0);
     void fill_expert_cache();
+    /// The experts outside VRAM, warmest first by the counts: the order the tiers take them in.
+    std::vector<std::pair<int32_t, int32_t>> tier_order(const std::vector<int64_t>& counts) const;
+    /// What the tier file should hold now: the warmest `tier_bytes` of tier_order() after the RAM tier's.
+    std::vector<std::pair<int32_t, int32_t>> tier_want(const std::vector<int64_t>& counts) const;
+    uint64_t tier_model_id() const;
+    void build_tiers();
     void start_swaps();
     void plan_ahead(Layer& L, int il);
     void run(const int32_t* tokens, int n);
@@ -723,6 +737,12 @@ protected:
     std::vector<Image> images_;          ///< the sequence's pictures, by row
     uint64_t images_set_ = 0;            ///< counts images(): what was derived from an earlier list is stale
     std::vector<int64_t> use_, prior_;   ///< routed count per (layer, expert): this run, and the profile's
+    // the expert tiers (build_tiers())
+    void* ram_tier_ = nullptr;           ///< the RAM tier's bytes
+    size_t ram_tier_bytes_ = 0;
+    std::vector<std::pair<int32_t, int32_t>> ram_tier_set_;   ///< the experts it holds
+    ExpertTier tier_;                    ///< the tier file, mapped
+    int64_t ram_experts_ = 0, tier_experts_ = 0;   ///< experts in each
     Stats stats_;
 };
 

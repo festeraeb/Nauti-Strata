@@ -343,10 +343,13 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
         v.elem = (MetaType)c.read<uint32_t>();
         v.count = c.read<uint64_t>();
         if (v.count > (1u << 24)) throw std::runtime_error("GGUF: implausible array length");
-        v.items.reserve((size_t)std::min<uint64_t>(v.count, 64));
+        // Per-layer arrays are read whole (Mistral Large 4 has 72 layers); a token list of 200,000 strings keeps a
+        // sample, since the count is what matters there.
+        constexpr uint64_t kKeep = 4096;
+        v.items.reserve((size_t)std::min<uint64_t>(v.count, kKeep));
         for (uint64_t i = 0; i < v.count; ++i) {
             MetaValue e = read_value(c, v.elem, depth + 1);
-            if (i < 64) v.items.push_back(std::move(e)); // keep a sample; the count is what matters
+            if (i < kKeep) v.items.push_back(std::move(e));
         }
         break;
     }

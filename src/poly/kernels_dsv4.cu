@@ -595,4 +595,50 @@ void permute_groups(const float* x, float* y, int n, int groups, int rows, bool 
     ck("permute_groups");
 }
 
+// ---- Mistral Large 4 ----
+
+// A block a head of a token, a thread a rotary pair: in place.  neox pairs value i with i + n_rot / 2, else 2i
+// with 2i + 1 (ggml's NEOX and NORM modes); factors[i] divides the pair's angle (LeRoPE's learned frequencies).
+__global__ void rope_ext_kernel(float* x, int dim, int off, int n_rot, Rope r, const float* __restrict__ factors,
+                                bool neox, long long pos, int step) {
+    const size_t base = (size_t(blockIdx.y) * gridDim.x + blockIdx.x) * dim + off;
+    const int i = threadIdx.x;   // the pair
+    if (i >= n_rot / 2) return;
+    const int i0 = neox ? i : 2 * i, i1 = neox ? i + n_rot / 2 : 2 * i + 1;
+    const float p = float(position(nullptr, pos, step, blockIdx.y));
+    const float f = factors ? factors[i] : 1.0f;
+    float c, s;
+    yarn(p * powf(r.theta_scale, float(i)) / f, r, 2 * i, false, c, s);
+    const float a = x[base + i0], b = x[base + i1];
+    x[base + i0] = a * c - b * s;
+    x[base + i1] = a * s + b * c;
+}
+
+void rope_ext(float* x, int dim, int heads, int off, int n_rot, const Rope& r, const float* factors, bool neox,
+              int64_t pos, int rows, void* stream) {
+    if (rows <= 0) return;
+    if (n_rot % 2 || n_rot > 2048 || off + n_rot > dim)
+        throw std::invalid_argument("rope_ext: the turned values are not an even run inside the head");
+    const int threads = std::max(WARP, (n_rot / 2 + WARP - 1) / WARP * WARP);
+    rope_ext_kernel<<<dim3(heads, rows), threads, 0, cs(stream)>>>(x, dim, off, n_rot, r, factors, neox, (long long) pos,
+                                                                   1);
+    ck("rope_ext");
+}
+
+// SSMax: a head's values times s[h] * ln(pos + 1) + b[h], with the logarithm as llama.cpp's attention-temperature
+// input holds it (double, then float).  A block a head of a token.
+__global__ void ssmax_kernel(float* x, const float* __restrict__ s, const float* __restrict__ b, int dim, long long pos) {
+    const int h = blockIdx.x, t = blockIdx.y;
+    const float lg = float(log(floor(double(pos + t)) + 1.0) + 1.0) - 1.0f;
+    const float k = s[h] * lg + b[h];
+    float* row = x + (size_t(t) * gridDim.x + h) * dim;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) row[i] *= k;
+}
+
+void ssmax_scale(float* x, const float* s, const float* b, int dim, int heads, int64_t pos, int rows, void* stream) {
+    if (rows <= 0) return;
+    ssmax_kernel<<<dim3(heads, rows), 256, 0, cs(stream)>>>(x, s, b, dim, (long long) pos);
+    ck("ssmax_scale");
+}
+
 }  // namespace strata::poly
