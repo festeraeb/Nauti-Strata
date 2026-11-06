@@ -1896,13 +1896,11 @@ void Engine::alloc() {
 // layers, and the tier file is its own (path + ".L<first layer>"), so that the engines do not take the whole RAM
 // budget each or write over one another's file.
 double Engine::tier_share() const {
-    int mine = 0, all = 0;
-    for (int il = 0; il < (int) layers_.size(); ++il) {
-        if (!layers_[(size_t) il].moe) continue;
-        ++all;
-        if (runs(il)) ++mine;
-    }
-    return all ? (double) mine / all : 1.0;
+    // Layer::moe is set only for the layers this engine loaded, so the share is by layers: the model's
+    // [lo_, hi_) over all of them (the dense first layer counts as one, a small error)
+    if (!split_ || n_layer_ <= 0) return 1.0;
+    const int mine = std::max(0, std::min(hi_, n_layer_) - lo_);
+    return std::clamp((double) mine / n_layer_, 0.0, 1.0);
 }
 
 std::string Engine::tier_path() const {
