@@ -29,6 +29,10 @@ def llama_steps(url, ids, steps, n_probs):
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=7200) as r:
         res = json.loads(r.read())
+    return llama_steps_of(res)
+
+
+def llama_steps_of(res):
     out = []
     for step in res.get("completion_probabilities", []):
         tops = step.get("top_logprobs") or step.get("probs") or []
@@ -65,7 +69,8 @@ def main():
     ap.add_argument("--ids", required=True, help="comma-separated token ids of the prompt")
     ap.add_argument("--steps", type=int, default=4)
     ap.add_argument("--n-probs", type=int, default=20)
-    ap.add_argument("--llama", required=True, help="llama-server base URL")
+    ap.add_argument("--llama", help="llama-server base URL")
+    ap.add_argument("--llama-json", help="a saved /completion answer (with n_probs) instead of calling the server")
     ap.add_argument("--strata-log", help="stderr of a strata-poly --top-probs run")
     ap.add_argument("--strata-cmd", help="strata-poly command (model included); --tokens/--max-new/--top-probs are added")
     ap.add_argument("--tol", type=float, default=0.05, help="largest |dp| over shared ids called a pass")
@@ -86,7 +91,12 @@ def main():
         print("no 'top' lines from strata-poly", file=sys.stderr)
         return 2
 
-    l_steps, l_tokens, l_text = llama_steps(a.llama, ids, a.steps, a.n_probs)
+    if a.llama_json:
+        l_steps, l_tokens, l_text = llama_steps_of(json.load(open(a.llama_json)))
+    elif a.llama:
+        l_steps, l_tokens, l_text = llama_steps(a.llama, ids, a.steps, a.n_probs)
+    else:
+        ap.error("--llama or --llama-json")
     print(f"llama.cpp continuation: {l_tokens} {l_text!r}")
     print(f"{'step':>4} {'strata':>8} {'llama':>8} {'p_strata':>9} {'p_llama':>9} {'top5':>5} {'max|dp|':>8} verdict")
     ok = True
