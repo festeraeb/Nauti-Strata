@@ -1,13 +1,16 @@
 // src/poly/expert_tier.cpp - the heat-ordered expert file: written whole through a temporary, mapped for reading.
 #include "expert_tier.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 namespace strata::poly {
@@ -49,9 +52,31 @@ uint64_t ExpertTier::id_of(const std::string& s) {
     return h;
 }
 
+ExpertTier::Room ExpertTier::room(uint64_t capacity, uint64_t meta_bytes, uint64_t free_bytes, uint64_t old_bytes) {
+    const uint64_t total = free_bytes + old_bytes;
+    Room r{};
+    r.capacity = total > meta_bytes ? std::min(capacity, total - meta_bytes) : 0;
+    r.drop_old = old_bytes > 0 && r.capacity + meta_bytes > free_bytes;
+    return r;
+}
+
 size_t ExpertTier::write(const std::string& path, uint32_t n_layer, uint32_t n_expert, uint64_t model_id,
                          uint64_t profile_id, const std::vector<std::pair<int32_t, int32_t>>& order, const Fetch& fetch,
                          uint64_t capacity) {
+    // as much as the filesystem holds: its free space plus the old file this one replaces
+    {
+        const uint64_t meta = sizeof(Header) + (uint64_t) n_layer * n_expert * sizeof(Entry) + (1ull << 20);
+        std::filesystem::path dir = std::filesystem::path(path).parent_path();
+        if (dir.empty()) dir = ".";
+        struct statvfs vs{};
+        struct stat old{};
+        const bool have_old = ::stat(path.c_str(), &old) == 0;
+        if (::statvfs(dir.c_str(), &vs) == 0) {
+            const Room r = room(capacity, meta, (uint64_t) vs.f_bavail * vs.f_frsize, have_old ? (uint64_t) old.st_size : 0);
+            capacity = r.capacity;
+            if (r.drop_old) ::unlink(path.c_str());
+        }
+    }
     // which experts fit: whole ones, hottest first, each once
     std::vector<Entry> entries;
     std::vector<TierSpan> spans;

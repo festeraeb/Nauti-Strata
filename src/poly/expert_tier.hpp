@@ -59,8 +59,19 @@ public:
     /// The bytes of a layer's expert in the model: its spans and their sizes.  false: the tier leaves it out.
     using Fetch = std::function<bool(int layer, int expert, TierSpan& span, uint64_t& gu_bytes, uint64_t& d_bytes)>;
 
+    /// What a rewrite of a tier may take on its filesystem.  `free_bytes` is the space free there now and
+    /// `old_bytes` the file at the tier's name that the rewrite replaces; `meta_bytes` covers the header, the entries
+    /// and the filesystem's own overhead.  The budget shrinks to what fits; when free space alone cannot hold the
+    /// new file beside the old one, the old one is removed first (the tier is a cache: losing it costs a reload).
+    struct Room {
+        uint64_t capacity;   ///< expert bytes the rewrite may write
+        bool drop_old;       ///< remove the old file before writing the new one
+    };
+    static Room room(uint64_t capacity, uint64_t meta_bytes, uint64_t free_bytes, uint64_t old_bytes);
+
     /// Writes the tier file at `path`: the experts of `order`, hottest first, as many whole ones as fit in
-    /// `capacity` bytes of expert data (the header and entries come on top).  The file is written as path + ".tmp"
+    /// `capacity` bytes of expert data (the header and entries come on top), less if the filesystem holds less (see
+    /// room()).  The file is written as path + ".tmp"
     /// and renamed over `path` once complete, so a crash leaves no half tier under the name.  Returns the experts
     /// written.  Throws std::runtime_error naming the file on an I/O error.
     static size_t write(const std::string& path, uint32_t n_layer, uint32_t n_expert, uint64_t model_id,

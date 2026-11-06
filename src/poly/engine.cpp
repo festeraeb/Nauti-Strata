@@ -2049,9 +2049,18 @@ void Engine::build_tiers() {
             d = L.d_bytes;
             return true;
         };
-        const size_t n = ExpertTier::write(tier_path(), (uint32_t) layers_.size(), (uint32_t) n_expert_, model_id,
-                                           profile_id, want, fetch, (uint64_t) ((double) ((uint64_t) opt_.expert_tier_mib << 20) * tier_share()));
-        tier_.open(tier_path(), model_id);
+        size_t n = 0;
+        try {
+            n = ExpertTier::write(tier_path(), (uint32_t) layers_.size(), (uint32_t) n_expert_, model_id, profile_id,
+                                  want, fetch, (uint64_t) ((double) ((uint64_t) opt_.expert_tier_mib << 20) * tier_share()));
+            tier_.open(tier_path(), model_id);
+        } catch (const std::exception& e) {
+            // the tier is a cache: a full or failing disk costs this card its tier, not the engine
+            tier_.close();
+            tier_experts_ = 0;
+            std::fprintf(stderr, "expert tiers: %s; this card runs without a tier\n", e.what());
+            return;
+        }
         std::fprintf(stderr, "expert tiers: wrote %zu experts (%llu MiB) in %.1f s\n", n,
                      (unsigned long long) (tier_.data_bytes() >> 20),
                      std::chrono::duration<double>(Clock::now() - t0).count());
@@ -2119,8 +2128,13 @@ void Engine::save_profile() const {
         d = L.d_bytes;
         return true;
     };
-    ExpertTier::write(tier_path(), (uint32_t) layers_.size(), (uint32_t) n_expert_, tier_model_id(),
-                      ExpertTier::id_of(opt_.profile), want, fetch, (uint64_t) ((double) ((uint64_t) opt_.expert_tier_mib << 20) * tier_share()));
+    try {
+        ExpertTier::write(tier_path(), (uint32_t) layers_.size(), (uint32_t) n_expert_, tier_model_id(),
+                          ExpertTier::id_of(opt_.profile), want, fetch,
+                          (uint64_t) ((double) ((uint64_t) opt_.expert_tier_mib << 20) * tier_share()));
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "expert tiers: the rewrite for the next load failed (%s); the next load writes it\n", e.what());
+    }
 }
 
 void Engine::reset() {

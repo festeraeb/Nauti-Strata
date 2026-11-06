@@ -221,10 +221,29 @@ void test_ids() {
 
 }  // namespace
 
+
+// The room a rewrite may take on its filesystem: free space plus the old file it replaces, less the header and
+// entries.  The Optane under c4's tier is 13.4 GB; a 13,000 MiB budget filled it, and the next load's
+// "<name>.tmp" beside the old files ran out of space and took the engine down (2026-11-06).
+void test_room() {
+    const uint64_t G = 1ull << 30, M = 1ull << 20;
+    ExpertTier::Room r = ExpertTier::room(4 * G, M, 100 * G, 0);
+    check(r.capacity == 4 * G && !r.drop_old, "plenty of free space: the budget stands, the old file stays");
+    r = ExpertTier::room(4 * G, M, 100 * G, 3 * G);
+    check(r.capacity == 4 * G && !r.drop_old, "free space holds the new file beside the old one: old file stays");
+    r = ExpertTier::room(4 * G, M, 2 * G, 3 * G);
+    check(r.capacity == 4 * G && r.drop_old, "only free + old holds it: the old file goes first, budget stands");
+    r = ExpertTier::room(4 * G, M, G, 2 * G);
+    check(r.capacity == 3 * G - M && r.drop_old, "free + old is short: the budget shrinks to what fits");
+    r = ExpertTier::room(4 * G, M, M / 2, 0);
+    check(r.capacity == 0, "less room than the header: nothing fits");
+}
+
 int main() {
     const std::string dir = tmpdir();
     try {
         test_ids();
+        test_room();
         test_write_and_find(dir);
         test_edges(dir);
     } catch (const std::exception& e) {
