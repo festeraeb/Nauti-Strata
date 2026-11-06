@@ -1894,37 +1894,57 @@ void Engine::alloc() {
 
 // The experts outside VRAM, warmest first: by use per byte as fill_expert_cache() ranks them, among equals the
 // lower layer and expert first.
-std::vector<std::pair<int32_t, int32_t>> Engine::tier_order(const std::vector<int64_t>& counts) const {
+std::vector<std::pair<int32_t, int32_t>> Engine::tier_order(const std::vector<int64_t>& counts, bool next_load) const {
     struct Cand {
         int il, e;
         double value;
     };
     std::vector<Cand> cands;
+    size_t in_vram = 0;
     for (int il = 0; il < (int) layers_.size(); ++il) {
         const Layer& L = layers_[(size_t) il];
         if (!L.moe || !runs(il)) continue;
         const double bytes = (double) (2 * L.gu_bytes + L.d_bytes);
         for (int e = 0; e < n_expert_; ++e) {
-            if (L.slot[(size_t) e]) continue;   // in VRAM
+            if (L.slot[(size_t) e]) {
+                ++in_vram;
+                if (!next_load) continue;   // in VRAM now
+            }
             const size_t i = (size_t) il * n_expert_ + e;
             const double used = (double) (i < counts.size() ? counts[i] : 0);
             cands.push_back({il, e, used / bytes});
         }
     }
     std::stable_sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.value > b.value; });
+    // the next load fills VRAM with the warmest by these counts (fill_expert_cache()), as many as it holds now
+    if (next_load) cands.erase(cands.begin(), cands.begin() + (ptrdiff_t) std::min(in_vram, cands.size()));
     std::vector<std::pair<int32_t, int32_t>> order;
     order.reserve(cands.size());
     for (const Cand& c : cands) order.emplace_back(c.il, c.e);
     return order;
 }
 
-std::vector<std::pair<int32_t, int32_t>> Engine::tier_want(const std::vector<int64_t>& counts) const {
+std::vector<std::pair<int32_t, int32_t>> Engine::tier_want(const std::vector<int64_t>& counts, bool next_load) const {
     std::vector<std::pair<int32_t, int32_t>> want;
     if (opt_.expert_tier.empty() || opt_.expert_tier_mib <= 0) return want;
+    std::vector<std::pair<int32_t, int32_t>> order = tier_order(counts, next_load);
     std::set<std::pair<int32_t, int32_t>> ram(ram_tier_set_.begin(), ram_tier_set_.end());
+    size_t from = 0;
+    if (next_load) {   // the RAM tier of the next load: the warmest that fit, as build_tiers() takes them
+        ram.clear();
+        const size_t capacity = (size_t) std::max(opt_.ram_experts_mib, 0) << 20;
+        size_t used = 0;
+        for (; from < order.size(); ++from) {
+            const Layer& L = layers_[(size_t) order[from].first];
+            const size_t bytes = 2 * L.gu_bytes + L.d_bytes;
+            if (used + bytes > capacity) break;
+            used += bytes;
+        }
+    }
     const uint64_t capacity = (uint64_t) opt_.expert_tier_mib << 20;
     uint64_t used = 0;
-    for (const auto& le : tier_order(counts)) {
+    for (size_t i = from; i < order.size(); ++i) {
+        const auto& le = order[i];
         if (ram.count(le)) continue;
         const Layer& L = layers_[(size_t) le.first];
         const uint64_t bytes = 2 * L.gu_bytes + L.d_bytes;
@@ -1947,7 +1967,7 @@ uint64_t Engine::tier_model_id() const {
 void Engine::build_tiers() {
     std::vector<int64_t> counts(use_.size(), 0);
     for (size_t i = 0; i < counts.size(); ++i) counts[i] = (i < prior_.size() ? prior_[i] : 0) + use_[i];
-    std::vector<std::pair<int32_t, int32_t>> order = tier_order(counts);
+    std::vector<std::pair<int32_t, int32_t>> order = tier_order(counts, false);
     size_t next = 0;
     ram_tier_set_.clear();
     if (opt_.ram_experts_mib > 0 && !order.empty()) {
@@ -1983,7 +2003,7 @@ void Engine::build_tiers() {
         }
     }
     if (opt_.expert_tier.empty() || opt_.expert_tier_mib <= 0) return;
-    const std::vector<std::pair<int32_t, int32_t>> want = tier_want(counts);
+    const std::vector<std::pair<int32_t, int32_t>> want = tier_want(counts, false);
     const uint64_t model_id = tier_model_id();
     const uint64_t profile_id = ExpertTier::id_of(opt_.profile);
     bool reuse = false;
@@ -2065,7 +2085,7 @@ void Engine::save_profile() const {
     // The tier file follows the profile: when the counts now ask for a set that the file holds less than nine
     // tenths of, it is written again for the next load (this run keeps reading the mapping it has).
     if (opt_.expert_tier.empty() || opt_.expert_tier_mib <= 0 || !tier_.mapped()) return;
-    const std::vector<std::pair<int32_t, int32_t>> want = tier_want(all);
+    const std::vector<std::pair<int32_t, int32_t>> want = tier_want(all, true);
     std::set<std::pair<int32_t, int32_t>> have;
     for (const ExpertTier::Entry& en : tier_.entries()) have.emplace(en.layer, en.expert);
     size_t hit = 0;

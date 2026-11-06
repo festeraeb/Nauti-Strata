@@ -443,10 +443,13 @@ protected:
     bool input(int32_t token, int64_t row, float* dst) const;
     void lin(const Dev& w, const float* x, float* y, int n, const void* xq = nullptr, int rows_per_x = 0);
     void fill_expert_cache();
-    /// The experts outside VRAM, warmest first by the counts: the order the tiers take them in.
-    std::vector<std::pair<int32_t, int32_t>> tier_order(const std::vector<int64_t>& counts) const;
-    /// What the tier file should hold now: the warmest `tier_bytes` of tier_order() after the RAM tier's.
-    std::vector<std::pair<int32_t, int32_t>> tier_want(const std::vector<int64_t>& counts) const;
+    /// The experts outside VRAM, warmest first by the counts: the order the tiers take them in.  With `next_load`
+    /// the VRAM set is not the cache as it is but as the next load will fill it from these counts: as many of the
+    /// warmest as it holds now.
+    std::vector<std::pair<int32_t, int32_t>> tier_order(const std::vector<int64_t>& counts, bool next_load) const;
+    /// What the tier file should hold: the warmest expert_tier_mib of tier_order() after the RAM tier's.  With
+    /// `next_load` the RAM tier too is the next load's: the warmest ram_experts_mib after VRAM's.
+    std::vector<std::pair<int32_t, int32_t>> tier_want(const std::vector<int64_t>& counts, bool next_load) const;
     uint64_t tier_model_id() const;
     void build_tiers();
     void start_swaps();
