@@ -1187,7 +1187,7 @@ void usage() {
                  "  --expert-helper-mib N  what to ask it to hold at most, all cards together (default: all it has)\n"
                  "  --helper-swaps N       while an answer is written, the helper's set follows it: up to N of the\n"
                  "                         experts the answer keeps missing go over at a time, in the room of the\n"
-                 "                         ones it uses least (default 32; 0 keeps the set the profile chose, for\n"
+                 "                         ones it uses least (default 8; 0 keeps the set the profile chose, for\n"
                  "                         parity runs, with --expert-swaps 0)\n"
                  "  --tail-skip N          an expert outside VRAM that every token of a window ranks at place N+1\n"
                  "                         or later among its experts is left out: faster, and the answers move a\n"

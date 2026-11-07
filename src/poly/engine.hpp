@@ -94,7 +94,7 @@ struct Options {
     int expert_tier_mib = 0;      ///< the experts' bytes it holds at most
     std::string expert_helper;    ///< host:port of a strata-expert-helper whose GPUs hold experts; empty: none
     int expert_helper_mib = 0;    ///< what the engine asks the helper to hold at most, all cards together; 0: all it has
-    int helper_swaps = 32;        ///< while an answer is written, the helper's set follows it: up to this many of the
+    int helper_swaps = 8;         ///< while an answer is written, the helper's set follows it: up to this many of the
                                   ///< experts the answer keeps missing go over at a time, in the room of the ones it
                                   ///< uses least (helper_trade()); 0: the set stays as hold_remote() chose it
 };
