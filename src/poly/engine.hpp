@@ -499,6 +499,12 @@ protected:
     /// what the last trade brought, then asks the helper thread for the next one.
     void helper_follow(int written);
     void helper_loop();          ///< the thread that sends the trades: Release, then Hold, on holder_
+public:
+    /// Between requests: how many experts the helper's set may take over at a time from now on (0: it stays as
+    /// it is), on every card.  Returns what is set; -1 when there is no helper.
+    int set_helper_swaps(int n);
+    int helper_swaps() const { return holder_ ? opt_.helper_swaps : -1; }
+protected:
     void stop_helper_thread();
     bool in_tier(const void* p) const;   ///< p is in one of the tier files' mappings
     void start_swaps();

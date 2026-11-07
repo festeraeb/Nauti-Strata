@@ -2193,8 +2193,20 @@ bool Engine::in_tier(const void* p) const {
 // from now on; then the next trade, if the thread is free for it.  The experts given up are the CPU's from this
 // token on, before the helper frees them, so no Compute names an expert it no longer holds.  Nothing moves for a
 // prompt batch (written 0), as the VRAM cache holds still then too.
+int Engine::set_helper_swaps(int n) {
+    int set = -1;
+    for (Engine* e = this; e; e = e->next_.get()) {
+        if (!e->holder_) continue;
+        e->opt_.helper_swaps = std::max(0, n);
+        if (e->opt_.helper_swaps > 0 && !e->helper_thread_.joinable())
+            e->helper_thread_ = std::thread([e] { e->helper_loop(); });
+        set = e->opt_.helper_swaps;
+    }
+    return set;
+}
+
 void Engine::helper_follow(int written) {
-    if (!holder_ || opt_.helper_swaps <= 0) return;
+    if (!holder_) return;
     {
         std::unique_lock<std::mutex> lk(helper_m_);
         if (!helper_error_.empty()) {
@@ -2221,7 +2233,7 @@ void Engine::helper_follow(int written) {
             helper_asked_ = false;
         }
     }
-    if (written <= 0 || recent_.empty()) return;
+    if (written <= 0 || recent_.empty() || opt_.helper_swaps <= 0 || !helper_thread_.joinable()) return;
     const size_t ne = (size_t) n_expert_;
     vram_mask_.assign(remote_.size(), 0);
     for (int il = 0; il < (int) layers_.size(); ++il) {

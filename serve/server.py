@@ -1153,6 +1153,35 @@ class StrataEngine:
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
 
+    def helper_swaps(self, swaps: int | None, timeout: float = 30.0) -> dict:
+        """`HELPER [n]` between requests: the expert helper's set takes over up to n experts a token from now on
+        (0: it stays as it is); None asks the current value.  -> {"helper_swaps": n}; ValueError with the engine's
+        reason (no helper), EngineDied when it ended."""
+        if not self.alive():
+            raise EngineDied("the engine is not running")
+        self.proc.stdin.write("HELPER" + ("" if swaps is None else f" {int(swaps)}") + "\n")
+        self.proc.stdin.flush()
+        deadline = time.time() + timeout
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise EngineDied("the engine did not answer the HELPER command") from None
+            if line is None:
+                raise EngineDied("the engine ended")
+            line = line.strip()
+            if line.startswith("ERR"):
+                raise ValueError(line[4:].strip() or "the engine refused the HELPER command")
+            if line.startswith("HELPER "):
+                out = {}
+                for kv in line.split()[1:]:
+                    k, _, v = kv.partition("=")
+                    out[k] = int(v) if v.lstrip("-").isdigit() else v
+                self.info["helper_swaps"] = out.get("helper_swaps")
+                return out
+            if time.time() > deadline:
+                raise EngineDied("the engine did not answer the HELPER command")
+
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
         keys = ""
@@ -3647,6 +3676,23 @@ class Service:
 
     vram_wait_s = 300.0                                  # #533: how long POST /v1/vram waits for a running request
 
+    def helper(self, swaps: int | None) -> dict:
+        """POST /v1/helper {"swaps": n}: the expert helper's set takes over up to n experts a token from now on (0: it
+        stays as it is; null: report), applied between requests as /v1/vram is.  -> {"status": "ok", "helper_swaps": n}."""
+        if not hasattr(self.engine, "helper_swaps"):
+            raise ValueError("this engine has no expert helper control")
+        if not self.fifo.acquire(timeout=self.vram_wait_s):
+            raise ModelBusy("a request is still running; try again when it has finished")
+        try:
+            if not self.loaded():
+                raise ValueError("the model is not loaded")
+            out = self.engine.helper_swaps(swaps)
+            print(f"[strata] HELPER: the helper's set takes over up to {out.get('helper_swaps')} experts a token",
+                  flush=True)
+            return {"status": "ok", **out}
+        finally:
+            self.fifo.release()
+
     def vram(self, reserve_mib: int | None) -> dict:
         """#533, POST /v1/vram: keep `reserve_mib` of VRAM free for other programs (None: the reserve the engine
         started with), applied between requests - a request that is running finishes first (up to wait_s).  Only an
@@ -5857,6 +5903,17 @@ def make_handler(svc: Service):
                         raise ValueError("reserve_mib: a whole number of MiB (0 or more), or null for the start's")
                     try:
                         self._json(200, svc.vram(r))
+                    except EngineDied as e:
+                        self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                    return
+                if path == "/v1/helper":                     # the expert helper's take-over cap, between requests
+                    if not self._own_page("the expert helper can be changed"):
+                        return
+                    r = req.get("swaps")
+                    if r is not None and (isinstance(r, bool) or not isinstance(r, int) or r < 0):
+                        raise ValueError("swaps: a whole number (0 or more), or null to ask")
+                    try:
+                        self._json(200, svc.helper(r))
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return

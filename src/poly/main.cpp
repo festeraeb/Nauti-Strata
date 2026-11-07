@@ -840,6 +840,28 @@ int serve(Session& ss) {
             std::fflush(stdout);
             continue;
         }
+        // HELPER [n], the server's POST /v1/helper: the expert helper's set takes over up to n experts a token
+        // from now on (0: it stays as it is); alone, a report.  Between requests, as VRAM.
+        if (line.rfind("HELPER", 0) == 0 && (line.size() == 6 || line[6] == ' ')) {
+            if (writing()) {
+                std::printf("ERR HELPER: not while batch slots are writing\n");
+                std::fflush(stdout);
+                continue;
+            }
+            const bool bare = line.find_first_not_of(' ', 6) == std::string::npos;
+            char* end = nullptr;
+            const long long n = bare ? -1 : std::strtoll(line.c_str() + 6, &end, 10);
+            if (!bare && (end == line.c_str() + 6 || n < 0 || n > 4096)) {
+                std::printf("ERR expected: HELPER [swaps 0..4096]\n");
+                std::fflush(stdout);
+                continue;
+            }
+            const int now = bare ? engine.helper_swaps() : engine.set_helper_swaps((int) n);
+            if (now < 0) std::printf("ERR HELPER: this engine has no expert helper\n");
+            else std::printf("HELPER helper_swaps=%d\n", now);
+            std::fflush(stdout);
+            continue;
+        }
         if (line.rfind("GEN ", 0) != 0 && line.rfind("GENI ", 0) != 0) {
             std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> image_pad=<id> <file> <id,id,...>\n");
             std::fflush(stdout);
