@@ -1719,6 +1719,7 @@ void Engine::load(const Options& o) {
             }
         }
     }
+    hold_remote();
     build_tiers();
     const int threads = opt_.threads > 0 ? opt_.threads : usable_cpus();
     mind_memory();
@@ -1950,7 +1951,7 @@ std::vector<std::pair<int32_t, int32_t>> Engine::tier_order(const std::vector<in
         if (!L.moe || !runs(il)) continue;
         const double bytes = (double) (2 * L.gu_bytes + L.d_bytes);
         for (int e = 0; e < n_expert_; ++e) {
-            if (L.slot[(size_t) e]) {
+            if (L.slot[(size_t) e] || remote_at(il, e)) {   // the helper's GPUs come next after VRAM
                 ++in_vram;
                 if (!next_load) continue;   // in VRAM now
             }
@@ -2089,6 +2090,59 @@ void Engine::build_tiers() {
         std::fprintf(stderr, "expert tiers: %lld experts (%llu MiB) read from %s\n", (long long) here,
                      (unsigned long long) (f.map->data_bytes() >> 20), f.path.c_str());
     }
+}
+
+void Engine::hold_remote() {
+    remote_.assign(layers_.size() * (size_t) n_expert_, 0);
+    remote_held_ = 0;
+    if (opt_.expert_helper.empty() || n_moe_ == 0) return;
+    const auto t0 = Clock::now();
+    try {
+        helper_ = std::make_unique<RemoteHelper>(opt_.expert_helper,
+                                                 wire::model_key(gg_->bytes(), n_expert_, n_embd_, n_ff_exp_),
+                                                 n_expert_, n_embd_, n_ff_exp_);
+        // this card's share of what the helper holds, as of the RAM and tier budgets
+        uint64_t budget = helper_->capacity();
+        if (opt_.expert_helper_mib > 0) budget = std::min<uint64_t>(budget, (uint64_t) opt_.expert_helper_mib << 20);
+        budget = (uint64_t) ((double) budget * tier_share());
+        std::vector<int64_t> counts(use_.size(), 0);
+        for (size_t i = 0; i < counts.size(); ++i) counts[i] = (i < prior_.size() ? prior_[i] : 0) + use_[i];
+        std::vector<std::pair<int32_t, int32_t>> want;
+        uint64_t used = 0;
+        for (const auto& le : tier_order(counts, false)) {
+            const uint64_t b = expert_bytes(le.first) + 256;   // the helper pads each one so much
+            if (used + b > budget) continue;
+            want.push_back(le);
+            used += b;
+        }
+        uint64_t bytes = 0;
+        for (const auto& [il, e] : helper_->hold(want)) {
+            if (il < 0 || il >= (int) layers_.size() || e < 0 || e >= n_expert_ || !runs(il) ||
+                !layers_[(size_t) il].moe)
+                continue;
+            remote_[(size_t) il * (size_t) n_expert_ + (size_t) e] = 1;
+            ++remote_held_;
+            bytes += expert_bytes(il);
+        }
+        std::fprintf(stderr, "expert helper: %lld experts (%llu MiB) on %s, %d GPU(s) there, in %.1f s\n",
+                     (long long) remote_held_, (unsigned long long) (bytes >> 20), helper_->addr().c_str(),
+                     helper_->devices(), std::chrono::duration<double>(Clock::now() - t0).count());
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "expert helper: %s; this card runs without it\n", e.what());
+        helper_.reset();
+        std::fill(remote_.begin(), remote_.end(), 0);
+        remote_held_ = 0;
+    }
+}
+
+void Engine::drop_helper(const char* why) {
+    const char* tag = "expert helper: ";   // the connection's own errors say so already
+    if (std::strncmp(why, tag, std::strlen(tag)) == 0) why += std::strlen(tag);
+    std::fprintf(stderr, "expert helper: %s; this card computes its %lld experts itself from now on\n", why,
+                 (long long) remote_held_);
+    helper_.reset();
+    std::fill(remote_.begin(), remote_.end(), 0);
+    remote_held_ = 0;
 }
 
 uint64_t Engine::expert_bytes(int il) const {
@@ -2256,6 +2310,7 @@ const Stats& Engine::stats() const {
         all_stats_.batch_staged += s.batch_staged;
         all_stats_.swapped_experts += s.swapped_experts;
         all_stats_.tail_experts += s.tail_experts;
+        all_stats_.remote_experts += s.remote_experts;
         all_stats_.cpu_ms += s.cpu_ms;
         all_stats_.route_wait_ms += s.route_wait_ms;
     }
@@ -2399,8 +2454,9 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         };
         CpuExpert host[kCpuRows * kMaxUsed];
         Cached cached[kCpuRows * kMaxUsed];
+        wire::Entry remote[kCpuRows * kMaxUsed];   // the helper's GPUs hold these (hold_remote())
         int32_t host_e[kCpuRows * kMaxUsed], host_k[kCpuRows * kMaxUsed];   // a host entry's expert and its place
-        int n_host = 0, n_cached = 0;
+        int n_host = 0, n_cached = 0, n_remote = 0;
         for (int t = 0; t < m; ++t) {
             int ids[kMaxUsed];
             float w[kMaxUsed];
@@ -2411,6 +2467,10 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                 if (n_swap_ > 0) recent_[(size_t) il * n_expert_ + e] += 1.f;
                 if (const uint8_t* s = L.slot[e]) {
                     cached[n_cached++] = {s, w[k], at + t};
+                    continue;
+                }
+                if (helper_ && remote_at(il, (int) e)) {
+                    remote[n_remote++] = {(int32_t) e, t, w[k]};
                     continue;
                 }
                 host_e[n_host] = (int32_t) e;
@@ -2436,8 +2496,29 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
             }
             n_host = kept;
         }
+        // The helper's experts go first, so that its GPUs work while this machine's CPU does; its answer is read
+        // after the CPU's experts.  When it cannot be reached, they are computed here with the rest.
+        bool sent = false;
+        if (n_remote > 0) {
+            try {
+                helper_->send(il, m, limit, gelu_, h_x_ + (size_t) at * e_row, remote, n_remote);
+                sent = true;
+            } catch (const std::exception& e) {
+                drop_helper(e.what());
+            }
+            if (!sent) {
+                for (int i = 0; i < n_remote; ++i) {
+                    const TierSpan& sp = L.src[(size_t) remote[i].expert];
+                    host[n_host++] = {sp.gate, sp.up, sp.down, remote[i].weight, remote[i].row};
+                }
+                // cpu_experts() takes a token's experts together
+                std::stable_sort(host, host + n_host, [](const CpuExpert& a, const CpuExpert& b) { return a.row < b.row; });
+                n_remote = 0;
+            }
+        }
         stats_.gpu_experts += n_cached;
         stats_.cpu_experts += n_host;
+        stats_.remote_experts += n_remote;
         // The launches cost this thread more than they cost the card, so each one less counts.  The cached experts
         // go kSlots at a time, a launch a stage for all of them: gate and up, the activation, its quantization,
         // down.  Then one launch adds up to kSumRows of them into their tokens' rows, in the order they came.  A
@@ -2487,17 +2568,59 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
 
         // The next layer's router wait is what makes h_cpu_ free to write again.
         float* cpu = h_cpu_ + (size_t) at * e_row;
-        if (n_host == 0) {
+        if (n_host == 0 && !sent) {
             launch();
             std::fill(cpu, cpu + (size_t) m * e_row, 0.f);
             continue;
         }
         any_host = true;
         t0 = Clock::now();
-        cpu_experts(*workers_, host, n_host, m, (int) L.gu_type, (int) L.d_type, n_embd_, n_ff_exp_,
-                    h_x_ + (size_t) at * e_row, limit, gelu_, cpu,
-                    n_cached > 0 || (first && at == 0) ? &launch : nullptr);
+        if (n_host > 0)
+            cpu_experts(*workers_, host, n_host, m, (int) L.gu_type, (int) L.d_type, n_embd_, n_ff_exp_,
+                        h_x_ + (size_t) at * e_row, limit, gelu_, cpu,
+                        n_cached > 0 || (first && at == 0) ? &launch : nullptr);
+        else
+            launch();
         stats_.cpu_ms += ms_since(t0);
+        if (sent) {
+            const size_t len = (size_t) m * e_row;
+            float* got = n_host > 0 ? (remote_out_.resize(len), remote_out_.data()) : cpu;
+            try {
+                helper_->recv(got, m);
+                // STRATA_HELPER_CHECK=1: the same experts on this CPU too, and how far the helper's GPUs were
+                static const bool check = [] { const char* v = std::getenv("STRATA_HELPER_CHECK"); return v && v[0] == '1'; }();
+                if (check) {
+                    CpuExpert again[kCpuRows * kMaxUsed];
+                    for (int i = 0; i < n_remote; ++i) {
+                        const TierSpan& sp = L.src[(size_t) remote[i].expert];
+                        again[i] = {sp.gate, sp.up, sp.down, remote[i].weight, remote[i].row};
+                    }
+                    std::vector<float> ref(len);
+                    cpu_experts(*workers_, again, n_remote, m, (int) L.gu_type, (int) L.d_type, n_embd_, n_ff_exp_,
+                                h_x_ + (size_t) at * e_row, limit, gelu_, ref.data());
+                    double num = 0.0, den = 0.0;
+                    for (size_t i = 0; i < len; ++i) {
+                        num += ((double) got[i] - ref[i]) * ((double) got[i] - ref[i]);
+                        den += (double) ref[i] * ref[i];
+                    }
+                    static std::atomic<int> shown{0};
+                    if (shown.fetch_add(1) < 40)
+                        std::fprintf(stderr, "expert helper check: blk.%d, %d experts, %d rows: relative error %.5f\n",
+                                     il, n_remote, m, den > 0 ? std::sqrt(num / den) : 0.0);
+                }
+            } catch (const std::exception& e) {
+                drop_helper(e.what());
+                CpuExpert again[kCpuRows * kMaxUsed];   // in token order, as they were routed
+                for (int i = 0; i < n_remote; ++i) {
+                    const TierSpan& sp = L.src[(size_t) remote[i].expert];
+                    again[i] = {sp.gate, sp.up, sp.down, remote[i].weight, remote[i].row};
+                }
+                cpu_experts(*workers_, again, n_remote, m, (int) L.gu_type, (int) L.d_type, n_embd_, n_ff_exp_,
+                            h_x_ + (size_t) at * e_row, limit, gelu_, got);
+            }
+            if (got != cpu)
+                for (size_t i = 0; i < len; ++i) cpu[i] += got[i];
+        }
     }
     return any_host;
 }

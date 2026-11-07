@@ -16,6 +16,7 @@
 
 #include "cpu_experts.hpp"
 #include "expert_tier.hpp"
+#include "remote_helper.hpp"
 
 #include <condition_variable>
 #include <cstddef>
@@ -90,6 +91,8 @@ struct Options {
     int ram_experts_mib = 0;      ///< RAM for the warm experts; 0: none
     std::string expert_tier;      ///< the tier file; empty: none
     int expert_tier_mib = 0;      ///< the experts' bytes it holds at most
+    std::string expert_helper;    ///< host:port of a strata-expert-helper whose GPUs hold experts; empty: none
+    int expert_helper_mib = 0;    ///< what the engine asks the helper to hold at most, all cards together; 0: all it has
 };
 
 /// A thing a model's file may call by other names than the engine does: converters differ.
@@ -144,6 +147,7 @@ struct Stats {
     int64_t tokens = 0, gpu_experts = 0, cpu_experts = 0, batch_cached = 0, batch_staged = 0;
     int64_t swapped_experts = 0;   ///< experts that took a cached one's slot (follow())
     int64_t tail_experts = 0;      ///< a token's experts left out by Options::tail_skip
+    int64_t remote_experts = 0;    ///< a token's experts the helper's GPUs computed (Options::expert_helper)
     double cpu_ms = 0, route_wait_ms = 0;
 };
 
@@ -468,6 +472,14 @@ protected:
     bool open_tier(TierFile& f, const std::vector<std::pair<int32_t, int32_t>>& want, uint64_t model_id,
                    uint64_t profile_id);
     void build_tiers();
+    /// After the VRAM cache: the warmest of the rest that the helper's GPUs will hold, before RAM and the tiers
+    /// rank theirs (Options::expert_helper).
+    void hold_remote();
+    bool remote_at(int il, int e) const {
+        return !remote_.empty() && remote_[(size_t) il * (size_t) n_expert_ + (size_t) e];
+    }
+    /// The helper failed: its experts are computed here from now on, from the model's file.
+    void drop_helper(const char* why);
     void start_swaps();
     void plan_ahead(Layer& L, int il);
     void run(const int32_t* tokens, int n);
@@ -761,6 +773,10 @@ protected:
     size_t ram_tier_bytes_ = 0;
     std::vector<std::pair<int32_t, int32_t>> ram_tier_set_;   ///< the experts it holds
     std::vector<TierFile> tiers_;        ///< the tier files, one a device (tier_files())
+    std::unique_ptr<RemoteHelper> helper_;   ///< this card's connection to the expert helper
+    std::vector<uint8_t> remote_;        ///< per (layer, expert): the helper holds it
+    int64_t remote_held_ = 0;            ///< experts it holds for this card
+    std::vector<float> remote_out_;      ///< its answer, while the CPU's experts' sum is in h_cpu_
     int64_t ram_experts_ = 0, tier_experts_ = 0;   ///< experts in each
     Stats stats_;
 };

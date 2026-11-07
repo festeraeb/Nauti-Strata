@@ -873,9 +873,11 @@ int serve(Session& ss) {
         // the cache's share of the experts looked up while answering: a prompt batch's go through VRAM either way
         const long long hits = now.gpu_experts - before.gpu_experts;
         const long long misses = now.cpu_experts - before.cpu_experts;
-        std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld 0 0 0.0 %lld 0\n", (long long) r.produced, n,
+        // <offloaded>: the experts another GPU computed, the expert helper's, outside the hit rate's lookups
+        const long long remote = now.remote_experts - before.remote_experts;
+        std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld 0 0 0.0 %lld %lld\n", (long long) r.produced, n,
                     r.prompt_ms, r.decode_ms, r.finish, (long long) r.guessed_right, (long long) r.guessed,
-                    (long long) r.resume, hits, hits + misses, (long long) r.read);
+                    (long long) r.resume, hits, hits + misses, (long long) r.read, remote);
         std::fflush(stdout);
         if (admit >= 0) {
             Slot& sl = slots[(size_t) admit];
@@ -1091,6 +1093,10 @@ void usage() {
                  "                         misses read from all of them at once.  FILE@MiB gives a file a size\n"
                  "                         of its own\n"
                  "  --expert-tier-mib N    the experts' bytes each file holds at most (when no @MiB says)\n"
+                 "  --expert-helper HOST:PORT  a strata-expert-helper on another machine: its GPUs hold the warmest\n"
+                 "                         experts after this machine's VRAM and compute them for it, a layer's in\n"
+                 "                         one round trip beside the CPU's own (RAM and the tiers take the next)\n"
+                 "  --expert-helper-mib N  what to ask it to hold at most, all cards together (default: all it has)\n"
                  "  --tail-skip N          an expert outside VRAM that every token of a window ranks at place N+1\n"
                  "                         or later among its experts is left out: faster, and the answers move a\n"
                  "                         little (default 0 = none is; setup gives Qwen3.6 6)\n"
@@ -1158,6 +1164,8 @@ int main(int argc, char** argv) {
         else if (a == "--ram-experts-mib") o.ram_experts_mib = std::atoi(val());
         else if (a == "--expert-tier") o.expert_tier = val();
         else if (a == "--expert-tier-mib") o.expert_tier_mib = std::atoi(val());
+        else if (a == "--expert-helper") o.expert_helper = val();
+        else if (a == "--expert-helper-mib") o.expert_helper_mib = std::atoi(val());
         else if (a == "--layer-split") o.layer_split = val();
         else if (a == "--batch" || a == "--slots") o.batch = std::atoi(val());
         else if (a == "--check-batch") check = std::atoi(val());

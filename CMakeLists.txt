@@ -260,6 +260,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(expert_tier_test src/poly/expert_tier_test.cpp src/poly/expert_tier.cpp)
   target_include_directories(expert_tier_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   add_test(NAME expert_tier_test COMMAND expert_tier_test)
+  # the expert helper's messages over a loopback TCP connection (no CUDA)
+  add_executable(expert_wire_test src/poly/expert_wire_test.cpp src/poly/expert_wire.cpp)
+  target_link_libraries(expert_wire_test PRIVATE Threads::Threads)
+  add_test(NAME expert_wire_test COMMAND expert_wire_test)
   # the reader refuses a duplicate tensor name at open, naming it (a synthetic GGUF: no model, no GPU)
   add_executable(gguf_reader_test src/artifact/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE strata_artifact)
@@ -1844,6 +1848,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   add_executable(strata-poly src/poly/main.cpp src/poly/engine.cpp src/poly/glm5next.cpp src/poly/qwen35.cpp
                             src/poly/gemma4.cpp src/poly/deepseek4.cpp src/poly/lfm2moe.cpp src/poly/cpu_experts.cpp
                             src/poly/mistral_large4.cpp src/poly/ml4_layout.cpp src/poly/expert_tier.cpp
+                            src/poly/expert_wire.cpp src/poly/remote_helper.cpp
                             src/poly/kernels.cu src/poly/kernels_dsv4.cu src/core/conversation_memory.cpp)
   target_include_directories(strata-poly PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   # the driver's virtual memory calls: the attention caches grow with the conversation; on HIP they are HIP's
@@ -1857,6 +1862,12 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
                                            ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target}
                                            ${_strata_poly_driver}
                                            Threads::Threads)
+  # another machine's GPUs holding an engine's experts (--expert-helper on the engine's side)
+  add_executable(strata-expert-helper src/poly/expert_helper.cpp src/poly/expert_wire.cpp src/poly/kernels.cu)
+  target_include_directories(strata-expert-helper PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                                         ${_strata_gpu_include_directories})
+  target_link_libraries(strata-expert-helper PRIVATE strata_kernels ggml-base ${_strata_gpu_blas_target}
+                                                    ${_strata_gpu_runtime_target} Threads::Threads)
   # needs the model file, so it is run by hand: poly_expert_parity MODEL.gguf
   add_executable(poly_expert_parity src/poly/expert_parity.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu)
   target_include_directories(poly_expert_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -1869,6 +1880,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   add_executable(poly_draft_race_test src/poly/draft_race_test.cpp src/poly/engine.cpp src/poly/glm5next.cpp
                                       src/poly/qwen35.cpp src/poly/gemma4.cpp src/poly/deepseek4.cpp
                                       src/poly/lfm2moe.cpp src/poly/mistral_large4.cpp src/poly/ml4_layout.cpp src/poly/expert_tier.cpp
+                                      src/poly/expert_wire.cpp src/poly/remote_helper.cpp
                                       src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
                                       src/core/conversation_memory.cpp)
   target_include_directories(poly_draft_race_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
