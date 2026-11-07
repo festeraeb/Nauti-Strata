@@ -263,11 +263,39 @@ void test_stale(const std::string& top) {
     for (const char* n : {"t", "t.L12"}) check(!std::filesystem::exists(dir + "/" + n), std::string("gone: ") + n);
 }
 
+// Several Optane modules: a path each, the hot experts dealt over all of them.
+void test_devices() {
+    auto p = ExpertTier::parse("/mnt/optane/t, /mnt/optane1/t@14000,/mnt/optane2/t", 13000);
+    check(p.size() == 3 && p[0].path == "/mnt/optane/t" && p[0].mib == 13000 && p[1].path == "/mnt/optane1/t" &&
+              p[1].mib == 14000 && p[2].mib == 13000,
+          "parse: paths, spaces, and a size of its own");
+    check(ExpertTier::parse("/a/t@x", 5)[0].path == "/a/t@x", "parse: an @ that is not a size stays in the path");
+    check(ExpertTier::parse("", 5).empty() && ExpertTier::parse(" , ", 5).empty(), "parse: nothing given, no tier");
+    bool threw = false;
+    try { ExpertTier::parse("/a/t,/a/t", 5); } catch (const std::runtime_error&) { threw = true; }
+    check(threw, "parse: one path twice is refused");
+
+    std::vector<std::pair<int32_t, int32_t>> order;
+    for (int e = 0; e < 10; ++e) order.emplace_back(0, e);
+    const auto ten = [](int32_t) { return (uint64_t) 10; };
+    auto d = ExpertTier::deal(order, ten, {40, 40});
+    check(d[0].size() == 4 && d[1].size() == 4, "deal: two equal devices take four each, two left out");
+    check(d[0][0].second == 0 && d[1][0].second == 1 && d[0][1].second == 2,
+          "deal: the hottest alternate, so both devices carry hot experts");
+    d = ExpertTier::deal(order, ten, {60, 20});
+    check(d[0].size() == 6 && d[1].size() == 2, "deal: by size, a bigger device takes more");
+    d = ExpertTier::deal(order, ten, {0, 30});
+    check(d[0].empty() && d[1].size() == 3, "deal: a device with no room takes none");
+    d = ExpertTier::deal(order, [](int32_t l) { return (uint64_t) (l ? 30 : 10); }, {25});
+    check(d[0].size() == 2, "deal: by bytes, not by count");
+}
+
 int main() {
     const std::string dir = tmpdir();
     try {
         test_ids();
         test_room();
+        test_devices();
         test_stale(dir);
         test_write_and_find(dir);
         test_edges(dir);

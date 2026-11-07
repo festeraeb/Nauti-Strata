@@ -78,6 +78,22 @@ public:
     /// a cache, and one that cannot be removed only costs the room it takes.
     static uint64_t drop_stale(const std::string& path, const std::vector<int>& starts);
 
+    /// The tier files of an --expert-tier value: comma-separated paths, one a device, each "path" or
+    /// "path@MiB" (the expert bytes it holds; `mib` when not given).  c4's tier is five Optane modules, a 16 GB
+    /// one and four on an x16 bifurcation card (2026-11-07): a path each, so that they are read side by side.
+    struct Spec {
+        std::string path;
+        int mib;
+    };
+    static std::vector<Spec> parse(const std::string& list, int mib);
+
+    /// Deals `order` (warmest first) out to devices that hold `caps` bytes each: an expert goes to the device
+    /// least full for its size once it is in, among equals the first, and is left out when none has room.  The
+    /// hot experts so spread over every device, and a token's misses read from several at once.
+    static std::vector<std::vector<std::pair<int32_t, int32_t>>> deal(
+        const std::vector<std::pair<int32_t, int32_t>>& order, const std::function<uint64_t(int32_t layer)>& bytes,
+        const std::vector<uint64_t>& caps);
+
     /// Writes the tier file at `path`: the experts of `order`, hottest first, as many whole ones as fit in
     /// `capacity` bytes of expert data (the header and entries come on top), less if the filesystem holds less (see
     /// room()).  The file is written as path + ".tmp"

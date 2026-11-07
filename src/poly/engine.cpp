@@ -367,7 +367,8 @@ Engine::~Engine() {
     OnCard here(device_, split_);
     map_quit_.store(true);
     if (mapper_.joinable()) mapper_.join();
-    tier_.close();
+    for (TierFile& f : tiers_)
+        if (f.map) f.map->close();
     if (ram_tier_) {
 #if defined(__linux__)
         munlock(ram_tier_, ram_tier_bytes_);
@@ -1025,10 +1026,11 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
         ck(cudaSetDevice(was), "cudaSetDevice");
     }
     // the tier files of another split (or of one card) are no use to this load and take its disk
-    if (!o.expert_tier.empty() && o.expert_tier_mib > 0)
-        if (const uint64_t gone = ExpertTier::drop_stale(o.expert_tier, starts))
-            std::fprintf(stderr, "expert tiers: removed %llu MiB of tier files this layer split does not use\n",
-                         (unsigned long long) (gone >> 20));
+    for (const ExpertTier::Spec& s : ExpertTier::parse(o.expert_tier, o.expert_tier_mib))
+        if (s.mib > 0)
+            if (const uint64_t gone = ExpertTier::drop_stale(s.path, starts))
+                std::fprintf(stderr, "expert tiers: removed %llu MiB of tier files this layer split does not use (%s)\n",
+                             (unsigned long long) (gone >> 20), s.path.c_str());
     if (starts.empty()) {
         std::unique_ptr<Engine> engine = make();
         engine->load(o);
@@ -1916,8 +1918,22 @@ double Engine::tier_share() const {
     return std::clamp((double) mine / n_layer_, 0.0, 1.0);
 }
 
-std::string Engine::tier_path() const {
-    return split_ ? opt_.expert_tier + ".L" + std::to_string(lo_) : opt_.expert_tier;
+std::vector<Engine::TierFile> Engine::tier_files() const {
+    std::vector<TierFile> out;
+    for (const ExpertTier::Spec& s : ExpertTier::parse(opt_.expert_tier, opt_.expert_tier_mib)) {
+        if (s.mib <= 0) continue;
+        TierFile f;
+        f.path = split_ ? s.path + ".L" + std::to_string(lo_) : s.path;
+        f.capacity = (uint64_t) ((double) ((uint64_t) s.mib << 20) * tier_share());
+        out.push_back(std::move(f));
+    }
+    return out;
+}
+
+uint64_t Engine::tier_capacity() const {
+    uint64_t sum = 0;
+    for (const TierFile& f : tier_files()) sum += f.capacity;
+    return sum;
 }
 
 // The experts outside VRAM, warmest first: by use per byte as fill_expert_cache() ranks them, among equals the
@@ -1956,7 +1972,8 @@ std::vector<std::pair<int32_t, int32_t>> Engine::tier_order(const std::vector<in
 
 std::vector<std::pair<int32_t, int32_t>> Engine::tier_want(const std::vector<int64_t>& counts, bool next_load) const {
     std::vector<std::pair<int32_t, int32_t>> want;
-    if (opt_.expert_tier.empty() || opt_.expert_tier_mib <= 0) return want;
+    const uint64_t capacity = tier_capacity();
+    if (capacity == 0) return want;
     std::vector<std::pair<int32_t, int32_t>> order = tier_order(counts, next_load);
     std::set<std::pair<int32_t, int32_t>> ram(ram_tier_set_.begin(), ram_tier_set_.end());
     size_t from = 0;
@@ -1971,7 +1988,6 @@ std::vector<std::pair<int32_t, int32_t>> Engine::tier_want(const std::vector<int
             used += bytes;
         }
     }
-    const uint64_t capacity = (uint64_t) ((double) ((uint64_t) opt_.expert_tier_mib << 20) * tier_share());
     uint64_t used = 0;
     for (size_t i = from; i < order.size(); ++i) {
         const auto& le = order[i];
@@ -2040,69 +2056,92 @@ void Engine::build_tiers() {
             std::fprintf(stderr, "expert tiers: %lld experts (%zu MiB) in RAM\n", (long long) ram_experts_, used >> 20);
         }
     }
-    if (opt_.expert_tier.empty() || opt_.expert_tier_mib <= 0) return;
-    const std::vector<std::pair<int32_t, int32_t>> want = tier_want(counts, false);
+    tiers_ = tier_files();
+    if (tiers_.empty()) return;
+    // the warmest after RAM's, dealt over the devices so that the hot ones are on all of them
+    std::vector<uint64_t> caps;
+    for (const TierFile& f : tiers_) caps.push_back(f.capacity);
+    const std::vector<std::vector<std::pair<int32_t, int32_t>>> dealt =
+        ExpertTier::deal(tier_want(counts, false), [this](int32_t il) { return expert_bytes(il); }, caps);
     const uint64_t model_id = tier_model_id();
     const uint64_t profile_id = ExpertTier::id_of(opt_.profile);
-    bool reuse = false;
+    const std::set<std::pair<int32_t, int32_t>> in_ram(ram_tier_set_.begin(), ram_tier_set_.end());
+    std::set<std::pair<int32_t, int32_t>> placed;   // an expert that two devices' files hold is read from the first
+    tier_experts_ = 0;
+    for (size_t d = 0; d < tiers_.size(); ++d) {
+        TierFile& f = tiers_[d];
+        if (!open_tier(f, dealt[d], model_id, profile_id)) continue;
+        int64_t here = 0;
+        for (const ExpertTier::Entry& en : f.map->entries()) {
+            if (!runs(en.layer)) continue;
+            Layer& L = layers_[(size_t) en.layer];
+            if (!L.moe || en.expert < 0 || en.expert >= n_expert_ || L.slot[(size_t) en.expert]) continue;
+            if (en.gu_bytes != L.gu_bytes || en.d_bytes != L.d_bytes) continue;   // another quantization's tier
+            const std::pair<int32_t, int32_t> le{en.layer, en.expert};
+            if (in_ram.count(le) || !placed.insert(le).second) continue;
+            TierSpan span;
+            if (!f.map->find(en.layer, en.expert, span)) continue;
+            L.src[(size_t) en.expert] = span;
+            ++here;
+        }
+        f.map->will_need();
+        tier_experts_ += here;
+        std::fprintf(stderr, "expert tiers: %lld experts (%llu MiB) read from %s\n", (long long) here,
+                     (unsigned long long) (f.map->data_bytes() >> 20), f.path.c_str());
+    }
+}
+
+uint64_t Engine::expert_bytes(int il) const {
+    const Layer& L = layers_[(size_t) il];
+    return (uint64_t) (2 * L.gu_bytes + L.d_bytes);
+}
+
+ExpertTier::Fetch Engine::tier_fetch() const {
+    return [this](int il, int e, TierSpan& span, uint64_t& gu, uint64_t& d) {
+        if (il < 0 || il >= (int) layers_.size()) return false;
+        const Layer& L = layers_[(size_t) il];
+        if (!L.moe || e < 0 || e >= n_expert_) return false;
+        span = TierSpan{L.exp_gate + (size_t) e * L.gu_stride, L.exp_up + (size_t) e * L.gu_stride,
+                        L.exp_down + (size_t) e * L.d_bytes};
+        gu = L.gu_bytes;
+        d = L.d_bytes;
+        return true;
+    };
+}
+
+bool Engine::open_tier(TierFile& f, const std::vector<std::pair<int32_t, int32_t>>& want, uint64_t model_id,
+                       uint64_t profile_id) {
+    f.map = std::make_unique<ExpertTier>();
+    if (want.empty()) return false;
     std::string why;
     try {
-        tier_.open(tier_path(), model_id);
+        f.map->open(f.path, model_id);
         std::set<std::pair<int32_t, int32_t>> have;
-        for (const ExpertTier::Entry& en : tier_.entries()) have.emplace(en.layer, en.expert);
+        for (const ExpertTier::Entry& en : f.map->entries()) have.emplace(en.layer, en.expert);
         size_t hit = 0;
         for (const auto& le : want) hit += have.count(le);
-        reuse = !want.empty() && hit * 10 >= want.size() * 9;
-        if (!reuse) why = std::to_string(hit) + " of the " + std::to_string(want.size()) + " experts wanted";
+        if (hit * 10 >= want.size() * 9) return true;
+        why = std::to_string(hit) + " of the " + std::to_string(want.size()) + " experts wanted";
     } catch (const std::exception& e) {
         why = e.what();
     }
-    if (!reuse) {
-        tier_.close();
-        std::fprintf(stderr, "expert tiers: writing %s (%s)\n", tier_path().c_str(), why.c_str());
-        const auto t0 = Clock::now();
-        ExpertTier::Fetch fetch = [&](int il, int e, TierSpan& span, uint64_t& gu, uint64_t& d) {
-            const Layer& L = layers_[(size_t) il];
-            if (!L.moe || e < 0 || e >= n_expert_) return false;
-            span = TierSpan{L.exp_gate + (size_t) e * L.gu_stride, L.exp_up + (size_t) e * L.gu_stride,
-                            L.exp_down + (size_t) e * L.d_bytes};
-            gu = L.gu_bytes;
-            d = L.d_bytes;
-            return true;
-        };
-        size_t n = 0;
-        try {
-            n = ExpertTier::write(tier_path(), (uint32_t) layers_.size(), (uint32_t) n_expert_, model_id, profile_id,
-                                  want, fetch, (uint64_t) ((double) ((uint64_t) opt_.expert_tier_mib << 20) * tier_share()));
-            tier_.open(tier_path(), model_id);
-        } catch (const std::exception& e) {
-            // the tier is a cache: a full or failing disk costs this card its tier, not the engine
-            tier_.close();
-            tier_experts_ = 0;
-            std::fprintf(stderr, "expert tiers: %s; this card runs without a tier\n", e.what());
-            return;
-        }
+    f.map->close();
+    std::fprintf(stderr, "expert tiers: writing %s (%s)\n", f.path.c_str(), why.c_str());
+    const auto t0 = Clock::now();
+    try {
+        const size_t n = ExpertTier::write(f.path, (uint32_t) layers_.size(), (uint32_t) n_expert_, model_id,
+                                           profile_id, want, tier_fetch(), f.capacity);
+        f.map->open(f.path, model_id);
         std::fprintf(stderr, "expert tiers: wrote %zu experts (%llu MiB) in %.1f s\n", n,
-                     (unsigned long long) (tier_.data_bytes() >> 20),
+                     (unsigned long long) (f.map->data_bytes() >> 20),
                      std::chrono::duration<double>(Clock::now() - t0).count());
+        return true;
+    } catch (const std::exception& e) {
+        // the tier is a cache: a full or failing disk costs this card that device's tier, not the engine
+        f.map->close();
+        std::fprintf(stderr, "expert tiers: %s; this card has no tier on that device\n", e.what());
+        return false;
     }
-    tier_experts_ = 0;
-    for (const ExpertTier::Entry& en : tier_.entries()) {
-        if (!runs(en.layer)) continue;
-        Layer& L = layers_[(size_t) en.layer];
-        if (!L.moe || L.slot[(size_t) en.expert]) continue;
-        if (en.gu_bytes != L.gu_bytes || en.d_bytes != L.d_bytes) continue;   // another quantization's tier
-        TierSpan span;
-        if (!tier_.find(en.layer, en.expert, span)) continue;
-        bool in_ram = false;
-        for (const auto& le : ram_tier_set_) in_ram = in_ram || (le.first == en.layer && le.second == en.expert);
-        if (in_ram) continue;
-        L.src[(size_t) en.expert] = span;
-        ++tier_experts_;
-    }
-    tier_.will_need();
-    std::fprintf(stderr, "expert tiers: %lld experts (%llu MiB) read from %s\n", (long long) tier_experts_,
-                 (unsigned long long) (tier_.data_bytes() >> 20), tier_path().c_str());
 }
 
 void Engine::save_profile() const {
@@ -2129,32 +2168,32 @@ void Engine::save_profile() const {
     if (written) std::filesystem::rename(tmp, opt_.profile, ec);   // std::rename replaces no file on Windows
     if (!written || ec) throw std::runtime_error("cannot write " + opt_.profile);
 
-    // The tier file follows the profile: when the counts now ask for a set that the file holds less than nine
-    // tenths of, it is written again for the next load (this run keeps reading the mapping it has).
-    if (opt_.expert_tier.empty() || opt_.expert_tier_mib <= 0 || !tier_.mapped()) return;
-    const std::vector<std::pair<int32_t, int32_t>> want = tier_want(all, true);
-    std::set<std::pair<int32_t, int32_t>> have;
-    for (const ExpertTier::Entry& en : tier_.entries()) have.emplace(en.layer, en.expert);
-    size_t hit = 0;
-    for (const auto& le : want) hit += have.count(le);
-    if (want.empty() || hit * 10 >= want.size() * 9) return;
-    std::fprintf(stderr, "expert tiers: the profile drifted (%zu of %zu wanted experts in the tier): rewriting %s\n",
-                 hit, want.size(), tier_path().c_str());
-    ExpertTier::Fetch fetch = [&](int il, int e, TierSpan& span, uint64_t& gu, uint64_t& d) {
-        const Layer& L = layers_[(size_t) il];
-        if (!L.moe || e < 0 || e >= n_expert_) return false;
-        span = TierSpan{L.exp_gate + (size_t) e * L.gu_stride, L.exp_up + (size_t) e * L.gu_stride,
-                        L.exp_down + (size_t) e * L.d_bytes};
-        gu = L.gu_bytes;
-        d = L.d_bytes;
-        return true;
-    };
-    try {
-        ExpertTier::write(tier_path(), (uint32_t) layers_.size(), (uint32_t) n_expert_, tier_model_id(),
-                          ExpertTier::id_of(opt_.profile), want, fetch,
-                          (uint64_t) ((double) ((uint64_t) opt_.expert_tier_mib << 20) * tier_share()));
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "expert tiers: the rewrite for the next load failed (%s); the next load writes it\n", e.what());
+    // The tier files follow the profile: when the counts now deal a device a set its file holds less than nine
+    // tenths of, that file is written again for the next load (this run keeps reading the mapping it has).
+    if (tiers_.empty()) return;
+    std::vector<uint64_t> caps;
+    for (const TierFile& f : tiers_) caps.push_back(f.capacity);
+    const std::vector<std::vector<std::pair<int32_t, int32_t>>> dealt =
+        ExpertTier::deal(tier_want(all, true), [this](int32_t il) { return expert_bytes(il); }, caps);
+    for (size_t d = 0; d < tiers_.size(); ++d) {
+        const TierFile& f = tiers_[d];
+        const std::vector<std::pair<int32_t, int32_t>>& want = dealt[d];
+        if (want.empty()) continue;
+        std::set<std::pair<int32_t, int32_t>> have;
+        if (f.map && f.map->mapped())
+            for (const ExpertTier::Entry& en : f.map->entries()) have.emplace(en.layer, en.expert);
+        size_t hit = 0;
+        for (const auto& le : want) hit += have.count(le);
+        if (hit * 10 >= want.size() * 9) continue;
+        std::fprintf(stderr, "expert tiers: the profile drifted (%zu of %zu wanted experts in the tier): rewriting %s\n",
+                     hit, want.size(), f.path.c_str());
+        try {
+            ExpertTier::write(f.path, (uint32_t) layers_.size(), (uint32_t) n_expert_, tier_model_id(),
+                              ExpertTier::id_of(opt_.profile), want, tier_fetch(), f.capacity);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "expert tiers: the rewrite of %s for the next load failed (%s); the next load writes it\n",
+                         f.path.c_str(), e.what());
+        }
     }
 }
 

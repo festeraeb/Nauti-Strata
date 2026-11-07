@@ -452,7 +452,21 @@ protected:
     std::vector<std::pair<int32_t, int32_t>> tier_want(const std::vector<int64_t>& counts, bool next_load) const;
     uint64_t tier_model_id() const;
     double tier_share() const;      ///< this engine's share of the MoE layers: its part of the tier budgets
-    std::string tier_path() const;  ///< the tier file: on a split, one a card
+    /// A tier file of this engine: one a device of --expert-tier (on a split, one a card on each), the expert
+    /// bytes it may hold (this engine's share of the device's), and its mapping.
+    struct TierFile {
+        std::string path;
+        uint64_t capacity = 0;
+        std::unique_ptr<ExpertTier> map;
+    };
+    std::vector<TierFile> tier_files() const;   ///< as --expert-tier names them, unmapped
+    uint64_t expert_bytes(int il) const;        ///< one routed expert of layer il: gate, up and down
+    ExpertTier::Fetch tier_fetch() const;       ///< an expert's bytes in the model's file, for a tier write
+    uint64_t tier_capacity() const;             ///< all of them together
+    /// Opens the tier file `f` if it holds nine tenths of `want`, else writes it with `want` first.  False, with
+    /// the reason printed, when it cannot be had: the device then holds nothing for this card.
+    bool open_tier(TierFile& f, const std::vector<std::pair<int32_t, int32_t>>& want, uint64_t model_id,
+                   uint64_t profile_id);
     void build_tiers();
     void start_swaps();
     void plan_ahead(Layer& L, int il);
@@ -746,7 +760,7 @@ protected:
     void* ram_tier_ = nullptr;           ///< the RAM tier's bytes
     size_t ram_tier_bytes_ = 0;
     std::vector<std::pair<int32_t, int32_t>> ram_tier_set_;   ///< the experts it holds
-    ExpertTier tier_;                    ///< the tier file, mapped
+    std::vector<TierFile> tiers_;        ///< the tier files, one a device (tier_files())
     int64_t ram_experts_ = 0, tier_experts_ = 0;   ///< experts in each
     Stats stats_;
 };

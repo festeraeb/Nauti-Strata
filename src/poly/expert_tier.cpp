@@ -52,6 +52,53 @@ uint64_t ExpertTier::id_of(const std::string& s) {
     return h;
 }
 
+std::vector<ExpertTier::Spec> ExpertTier::parse(const std::string& list, int mib) {
+    std::vector<Spec> out;
+    size_t at = 0;
+    while (at <= list.size()) {
+        size_t end = list.find(',', at);
+        if (end == std::string::npos) end = list.size();
+        std::string item = list.substr(at, end - at);
+        at = end + 1;
+        while (!item.empty() && item.front() == ' ') item.erase(item.begin());
+        while (!item.empty() && item.back() == ' ') item.pop_back();
+        if (item.empty()) continue;
+        Spec s{item, mib};
+        const size_t m = item.rfind('@');
+        if (m != std::string::npos && m + 1 < item.size() &&
+            item.find_first_not_of("0123456789", m + 1) == std::string::npos) {
+            s.path = item.substr(0, m);
+            s.mib = std::stoi(item.substr(m + 1));
+        }
+        if (s.path.empty()) throw std::runtime_error("--expert-tier: an entry has no path: \"" + item + "\"");
+        for (const Spec& o : out)
+            if (o.path == s.path) throw std::runtime_error("--expert-tier: " + s.path + " is given twice");
+        out.push_back(s);
+    }
+    return out;
+}
+
+std::vector<std::vector<std::pair<int32_t, int32_t>>> ExpertTier::deal(
+    const std::vector<std::pair<int32_t, int32_t>>& order, const std::function<uint64_t(int32_t layer)>& bytes,
+    const std::vector<uint64_t>& caps) {
+    std::vector<std::vector<std::pair<int32_t, int32_t>>> out(caps.size());
+    std::vector<uint64_t> used(caps.size(), 0);
+    for (const auto& le : order) {
+        const uint64_t b = bytes(le.first);
+        int best = -1;
+        double fill = 0.0;
+        for (size_t d = 0; d < caps.size(); ++d) {
+            if (caps[d] == 0 || used[d] + b > caps[d]) continue;
+            const double f = (double) (used[d] + b) / (double) caps[d];
+            if (best < 0 || f < fill) best = (int) d, fill = f;
+        }
+        if (best < 0) continue;
+        out[(size_t) best].push_back(le);
+        used[(size_t) best] += b;
+    }
+    return out;
+}
+
 bool ExpertTier::stale(const std::string& name, const std::string& base, const std::vector<int>& starts) {
     const bool split = !starts.empty();
     if (name == base) return split;
