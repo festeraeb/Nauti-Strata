@@ -17,6 +17,7 @@
 #include "cpu_experts.hpp"
 #include "expert_tier.hpp"
 #include "remote_helper.hpp"
+#include "routing.hpp"
 
 #include <condition_variable>
 #include <cstddef>
@@ -185,6 +186,14 @@ public:
     }
     int n_embd() const { return n_embd_; }
     int max_context() const { return opt_.max_context; }
+    int n_layer() const { return n_layer_; }
+    int n_used() const { return n_used_; }   ///< routed experts a token, each layer
+    /// Where the layers write the experts each token is routed to (NautiBurn's scrapes); nullptr: nowhere.  Every
+    /// card's engine of a split gets it.  A step() of several sequences writes nothing: its rows are not one
+    /// sequence's positions.
+    void set_routing(Routing* r) {
+        for (Engine* e = this; e; e = e->next_.get()) e->routing_ = r;
+    }
     int threads() const { return workers_ ? workers_->threads() : 0; }
     /// The NUMA node the CPU threads were kept on, and the share of the experts' pages it holds; -1: no node chosen.
     int numa_node() const { return node_; }
@@ -774,6 +783,7 @@ protected:
     std::vector<std::pair<int32_t, int32_t>> ram_tier_set_;   ///< the experts it holds
     std::vector<TierFile> tiers_;        ///< the tier files, one a device (tier_files())
     std::unique_ptr<RemoteHelper> helper_;   ///< this card's connection to the expert helper
+    Routing* routing_ = nullptr;         ///< set_routing()
     std::vector<uint8_t> remote_;        ///< per (layer, expert): the helper holds it
     int64_t remote_held_ = 0;            ///< experts it holds for this card
     std::vector<float> remote_out_;      ///< its answer, while the CPU's experts' sum is in h_cpu_

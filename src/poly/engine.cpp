@@ -2461,6 +2461,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
             int ids[kMaxUsed];
             float w[kMaxUsed];
             route(il, h_rl_ + (size_t) (at + t) * n_expert_, tok_ ? tok_[at + t] : -1, ids, w, route_tmp_.data());
+            if (routing_) routing_->put(pos_ + at + t, il, ids, n_used_);
             for (int k = 0; k < n_used_; ++k) {
                 const size_t e = (size_t) ids[k];
                 ++use_[(size_t) il * n_expert_ + e];
@@ -2792,6 +2793,8 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             route(il, h_rl_ + (size_t) t * n_expert_, tok_ ? tok_[t] : -1, ids_.data() + (size_t) t * n_used_,
                   w + (size_t) t * n_used_, tmp);
     });
+    if (routing_)
+        for (int t = 0; t < n; ++t) routing_->put(pos_ + t, il, ids_.data() + (size_t) t * n_used_, n_used_);
     count_.assign((size_t) n_expert_, 0);
     for (int i = 0; i < rr; ++i) {
         ++count_[(size_t) ids_[(size_t) i]];
@@ -3242,6 +3245,13 @@ void Engine::run(const int32_t* tokens, int n) {
 // logits.
 void Engine::step(const int* seqs, const int32_t* tokens, int n) {
     if (n < 1 || n > std::min(rows_, sequences())) throw std::logic_error("step takes 1 to sequences() tokens");
+    // several sequences' rows: not positions of the one the routing record follows
+    struct Pause {
+        Engine* e;
+        Routing* was;
+        ~Pause() { e->set_routing(was); }
+    } pause{this, routing_};
+    set_routing(nullptr);
     OnCard here(device_, split_);
     const int home = bound_;
     const auto use = [&](int s) { hold(s); };

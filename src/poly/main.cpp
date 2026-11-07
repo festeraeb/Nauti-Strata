@@ -13,6 +13,7 @@
 #include "strata/spec/suffix_drafter.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -29,6 +30,8 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <ctime>
+#include <filesystem>
 #include <vector>
 
 #ifdef _WIN32
@@ -594,8 +597,59 @@ struct Slot {
     Clock::time_point t0;
 };
 
+// NautiBurn's scrapes (routing.hpp), on with NAUTIBURN_SCRAPE_DIR as in our llama.cpp build: each answer's routing
+// as two files there, the prompt's and the answer's, which the fleet's puller collects.  NAUTIBURN_MODEL_ID and
+// NAUTIBURN_CLASS_ID name them (default: the model file's name, and "live-" before it).
+std::string g_model_path;
+
+struct Scraper {
+    std::string dir, model_id, class_id;
+    strata::poly::Routing routing;
+    long long n = 0;
+
+    explicit Scraper(Engine& engine) {
+        const char* d = std::getenv("NAUTIBURN_SCRAPE_DIR");
+        if (!d || !*d) return;
+        dir = d;
+        std::string stem = std::filesystem::path(g_model_path).stem().string();   // without .gguf
+        if (const size_t at = stem.find("-00001-of-"); at != std::string::npos) stem.resize(at);
+        std::transform(stem.begin(), stem.end(), stem.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+        const char* m = std::getenv("NAUTIBURN_MODEL_ID");
+        model_id = m && *m ? m : stem;
+        const char* c = std::getenv("NAUTIBURN_CLASS_ID");
+        class_id = c && *c ? c : "live-" + model_id;
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        routing.reset(engine.max_context(), engine.n_layer(), engine.n_used());
+        engine.set_routing(&routing);
+        std::fprintf(stderr, "strata-poly: NautiBurn scrapes to %s as %s (%s)\n", dir.c_str(), model_id.c_str(),
+                     class_id.c_str());
+    }
+    bool on() const { return !dir.empty(); }
+
+    /// The answer's two files: the prompt tokens read (from `resume`) and the tokens fed after it (all but the last
+    /// one picked, which no layer saw).
+    void write(const std::vector<int32_t>& prompt, int64_t resume, const std::vector<int32_t>& answer) {
+        if (!on()) return;
+        const long long stamp = (long long) std::time(nullptr);
+        const std::string tag = std::to_string(stamp) + "-" + std::to_string(++n);
+        const std::string base = dir + "/run-" + tag;
+        const int64_t len = (int64_t) prompt.size();
+        bool wrote = false;
+        if (resume < len)
+            wrote |= routing.write(base + ".json", model_id, class_id, "nb-poly-" + tag + "-prefill", "prefill", resume,
+                                   std::vector<int32_t>(prompt.begin() + resume, prompt.end()));
+        if (answer.size() > 1)
+            wrote |= routing.write(base + "-decode.json", model_id, class_id, "nb-poly-" + tag + "-decode", "decode", len,
+                                   std::vector<int32_t>(answer.begin(), answer.end() - 1));
+        if (!wrote) std::fprintf(stderr, "strata-poly: no NautiBurn scrape for this answer (nothing routed, or %s "
+                                         "cannot be written)\n", dir.c_str());
+    }
+};
+
 int serve(Session& ss) {
     Engine& engine = ss.engine;
+    Scraper scraper(engine);
     std::vector<Slot> slots((size_t) engine.sequences() - 1);
     std::printf("INFO context=%d expert_slots=%d expert_cache_mib=%lld pool_workers=%d conversation_cache_mib=%lld "
                 "conversation_cache_slots=%d conversation_cache_min_free_mib=%lld vram_free_mib=%lld vram_elastic=1 "
@@ -822,6 +876,8 @@ int serve(Session& ss) {
         int64_t resume = 0;
         Session::Result r;
         int32_t first = -1;   // the token BGEN's read picks
+        std::vector<int32_t> answer;   // for the scrape
+        if (scraper.on()) scraper.routing.clear(0, n + max_new);
         try {
             engine.bind(0);
             from_slot(ids);
@@ -838,6 +894,7 @@ int serve(Session& ss) {
                 ids, pictures, pad, turn_at, max_new, s, lines.stop,
                 [&](int32_t t) {
                     first = t;
+                    if (scraper.on()) answer.push_back(t);
                     std::printf("T %d\n", (int) t);
                     std::fflush(stdout);
                 },
@@ -879,6 +936,7 @@ int serve(Session& ss) {
                     r.prompt_ms, r.decode_ms, r.finish, (long long) r.guessed_right, (long long) r.guessed,
                     (long long) r.resume, hits, hits + misses, (long long) r.read, remote);
         std::fflush(stdout);
+        scraper.write(ids, resume, answer);
         if (admit >= 0) {
             Slot& sl = slots[(size_t) admit];
             const bool goes_on = std::strcmp(r.finish, "length") == 0 && first >= 0 && admit_max > 1 &&
@@ -1136,7 +1194,7 @@ int main(int argc, char** argv) {
             }
             return argv[++i];
         };
-        if (a == "--model") o.model = val();
+        if (a == "--model") o.model = g_model_path = val();
         else if (a == "--serve") want_serve = true;
         else if (a == "--max-context") o.max_context = std::atoi(val());
         else if (a == "--threads") o.threads = std::atoi(val());
