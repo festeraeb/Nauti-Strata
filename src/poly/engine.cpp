@@ -2,6 +2,8 @@
 // routed experts (the cache, the CPU, a prompt batch), the sequence's state, and the calls that feed tokens.
 #include "engine.hpp"
 
+#include "expert_follow.hpp"
+
 #include "deepseek4.hpp"
 #include "mistral_large4.hpp"
 #include "gemma4.hpp"
@@ -376,6 +378,7 @@ Engine::~Engine() {
         std::free(ram_tier_);
     }
     ram_tier_ = nullptr;
+    stop_helper_thread();
     if (follower_.joinable()) {
         {
             std::lock_guard<std::mutex> l(swap_m_);
@@ -1511,6 +1514,7 @@ void Engine::follow(int written) {
     if (written <= 0) return;
     const float keep = std::exp2(-(float) written / (float) kSwapHalf);
     for (float& r : recent_) r *= keep;
+    helper_follow(written);
     if (n_free == 0) return;
 
     // One pass over the experts lists, for each slot size, the ones that may come in, the most used first, and
@@ -1720,6 +1724,7 @@ void Engine::load(const Options& o) {
         }
     }
     hold_remote();
+    if (helper_ && recent_.empty()) recent_.assign(use_.size(), 0.f);   // the helper's set follows the answer by these
     build_tiers();
     const int threads = opt_.threads > 0 ? opt_.threads : usable_cpus();
     mind_memory();
@@ -2092,46 +2097,59 @@ void Engine::build_tiers() {
     }
 }
 
+// The helper holds this card's warmest experts after VRAM's, by the profile, in its share of the helper's room.
+// Two connections: holder_ holds (and releases, as the set follows the answer), helper_ computes.  The helper
+// frees a connection's holds when it ends, so a failed holder_ is a failed helper (helper_follow()).
 void Engine::hold_remote() {
     remote_.assign(layers_.size() * (size_t) n_expert_, 0);
+    remote_pending_.assign(remote_.size(), 0);
     remote_held_ = 0;
+    remote_bytes_ = remote_budget_ = 0;
     if (opt_.expert_helper.empty() || n_moe_ == 0) return;
     const auto t0 = Clock::now();
     try {
-        helper_ = std::make_unique<RemoteHelper>(opt_.expert_helper,
-                                                 wire::model_key(gg_->bytes(), n_expert_, n_embd_, n_ff_exp_),
-                                                 n_expert_, n_embd_, n_ff_exp_);
+        const uint64_t key = wire::model_key(gg_->bytes(), n_expert_, n_embd_, n_ff_exp_);
+        helper_ = std::make_unique<RemoteHelper>(opt_.expert_helper, key, n_expert_, n_embd_, n_ff_exp_);
+        holder_ = std::make_unique<RemoteHelper>(opt_.expert_helper, key, n_expert_, n_embd_, n_ff_exp_);
         // this card's share of what the helper holds, as of the RAM and tier budgets
         uint64_t budget = helper_->capacity();
         if (opt_.expert_helper_mib > 0) budget = std::min<uint64_t>(budget, (uint64_t) opt_.expert_helper_mib << 20);
-        budget = (uint64_t) ((double) budget * tier_share());
+        remote_budget_ = (uint64_t) ((double) budget * tier_share());
+        helper_layer_bytes_.assign(layers_.size(), 0);
+        for (int il = 0; il < (int) layers_.size(); ++il)
+            if (layers_[(size_t) il].moe && runs(il)) helper_layer_bytes_[(size_t) il] = expert_bytes(il) + 256;
         std::vector<int64_t> counts(use_.size(), 0);
         for (size_t i = 0; i < counts.size(); ++i) counts[i] = (i < prior_.size() ? prior_[i] : 0) + use_[i];
         std::vector<std::pair<int32_t, int32_t>> want;
         uint64_t used = 0;
         for (const auto& le : tier_order(counts, false)) {
             const uint64_t b = expert_bytes(le.first) + 256;   // the helper pads each one so much
-            if (used + b > budget) continue;
+            if (used + b > remote_budget_) continue;
             want.push_back(le);
             used += b;
         }
         uint64_t bytes = 0;
-        for (const auto& [il, e] : helper_->hold(want)) {
+        for (const auto& [il, e] : holder_->hold(want)) {
             if (il < 0 || il >= (int) layers_.size() || e < 0 || e >= n_expert_ || !runs(il) ||
                 !layers_[(size_t) il].moe)
                 continue;
             remote_[(size_t) il * (size_t) n_expert_ + (size_t) e] = 1;
             ++remote_held_;
             bytes += expert_bytes(il);
+            remote_bytes_ += expert_bytes(il) + 256;
         }
-        std::fprintf(stderr, "expert helper: %lld experts (%llu MiB) on %s, %d GPU(s) there, in %.1f s\n",
+        std::fprintf(stderr, "expert helper: %lld experts (%llu MiB) on %s, %d GPU(s) there, in %.1f s%s\n",
                      (long long) remote_held_, (unsigned long long) (bytes >> 20), helper_->addr().c_str(),
-                     helper_->devices(), std::chrono::duration<double>(Clock::now() - t0).count());
+                     helper_->devices(), std::chrono::duration<double>(Clock::now() - t0).count(),
+                     opt_.helper_swaps > 0 ? "; its set follows the answers" : "");
+        if (opt_.helper_swaps > 0) helper_thread_ = std::thread([this] { helper_loop(); });
     } catch (const std::exception& e) {
         std::fprintf(stderr, "expert helper: %s; this card runs without it\n", e.what());
         helper_.reset();
+        holder_.reset();
         std::fill(remote_.begin(), remote_.end(), 0);
         remote_held_ = 0;
+        remote_bytes_ = 0;
     }
 }
 
@@ -2140,9 +2158,120 @@ void Engine::drop_helper(const char* why) {
     if (std::strncmp(why, tag, std::strlen(tag)) == 0) why += std::strlen(tag);
     std::fprintf(stderr, "expert helper: %s; this card computes its %lld experts itself from now on\n", why,
                  (long long) remote_held_);
+    stop_helper_thread();
     helper_.reset();
+    holder_.reset();
     std::fill(remote_.begin(), remote_.end(), 0);
+    std::fill(remote_pending_.begin(), remote_pending_.end(), 0);
     remote_held_ = 0;
+    remote_bytes_ = 0;
+}
+
+void Engine::stop_helper_thread() {
+    if (!helper_thread_.joinable()) return;
+    {
+        std::lock_guard<std::mutex> l(helper_m_);
+        helper_quit_ = true;
+    }
+    helper_cv_.notify_all();
+    if (holder_) holder_->abort();   // a trade under way ends with an error instead of holding the join up
+    helper_thread_.join();
+    helper_quit_ = helper_busy_ = helper_asked_ = false;
+    helper_in_.clear();
+    helper_out_.clear();
+    helper_got_.clear();
+    helper_error_.clear();
+}
+
+bool Engine::in_tier(const void* p) const {
+    for (const TierFile& f : tiers_)
+        if (f.map && f.map->holds(p)) return true;
+    return false;
+}
+
+// Between evals, on the engine's thread, which alone writes remote_: what the last trade brought is the helper's
+// from now on; then the next trade, if the thread is free for it.  The experts given up are the CPU's from this
+// token on, before the helper frees them, so no Compute names an expert it no longer holds.  Nothing moves for a
+// prompt batch (written 0), as the VRAM cache holds still then too.
+void Engine::helper_follow(int written) {
+    if (!holder_ || opt_.helper_swaps <= 0) return;
+    {
+        std::unique_lock<std::mutex> lk(helper_m_);
+        if (!helper_error_.empty()) {
+            const std::string why = helper_error_;
+            lk.unlock();
+            drop_helper(why.c_str());
+            return;
+        }
+        if (helper_busy_) return;
+        if (helper_asked_) {
+            for (const auto& [il, e] : helper_in_) remote_pending_[(size_t) il * (size_t) n_expert_ + (size_t) e] = 0;
+            for (const auto& [il, e] : helper_got_) {
+                if (il < 0 || il >= (int) layers_.size() || e < 0 || e >= n_expert_ || !runs(il)) continue;
+                uint8_t& r = remote_[(size_t) il * (size_t) n_expert_ + (size_t) e];
+                if (r) continue;
+                r = 1;
+                ++remote_held_;
+                remote_bytes_ += expert_bytes(il) + 256;
+                ++stats_.helper_swapped;
+            }
+            helper_in_.clear();
+            helper_out_.clear();
+            helper_got_.clear();
+            helper_asked_ = false;
+        }
+    }
+    if (written <= 0 || recent_.empty()) return;
+    const size_t ne = (size_t) n_expert_;
+    vram_mask_.assign(remote_.size(), 0);
+    for (int il = 0; il < (int) layers_.size(); ++il) {
+        const Layer& L = layers_[(size_t) il];
+        if (helper_layer_bytes_[(size_t) il] == 0) continue;
+        for (int e = 0; e < n_expert_; ++e) {
+            const size_t i = (size_t) il * ne + (size_t) e;
+            vram_mask_[i] = L.slot[(size_t) e] != nullptr || (!coming_.empty() && coming_[i]);
+        }
+    }
+    const uint64_t room = remote_budget_ > remote_bytes_ ? remote_budget_ - remote_bytes_ : 0;
+    HelperTrade t = helper_trade((int) layers_.size(), n_expert_, recent_.data(),
+                                 prior_.empty() ? nullptr : prior_.data(), vram_mask_.data(), remote_.data(),
+                                 remote_pending_.data(), helper_layer_bytes_.data(), room, opt_.helper_swaps);
+    if (t.in.empty() && t.out.empty()) return;
+    for (const auto& [il, e] : t.out) {
+        remote_[(size_t) il * ne + (size_t) e] = 0;
+        --remote_held_;
+        remote_bytes_ -= std::min<uint64_t>(remote_bytes_, expert_bytes(il) + 256);
+    }
+    for (const auto& [il, e] : t.in) remote_pending_[(size_t) il * ne + (size_t) e] = 1;
+    {
+        std::lock_guard<std::mutex> l(helper_m_);
+        helper_in_ = std::move(t.in);
+        helper_out_ = std::move(t.out);
+        helper_busy_ = helper_asked_ = true;
+    }
+    helper_cv_.notify_one();
+}
+
+void Engine::helper_loop() {
+    std::unique_lock<std::mutex> lk(helper_m_);
+    for (;;) {
+        helper_cv_.wait(lk, [&] { return helper_quit_ || helper_busy_; });
+        if (helper_quit_) return;
+        const std::vector<std::pair<int32_t, int32_t>> in = helper_in_, out = helper_out_;
+        lk.unlock();
+        std::vector<std::pair<int32_t, int32_t>> got;
+        std::string err;
+        try {
+            holder_->release(out);   // the room first
+            if (!in.empty()) got = holder_->hold(in);
+        } catch (const std::exception& e) {
+            err = e.what();
+        }
+        lk.lock();
+        helper_got_ = std::move(got);
+        if (!err.empty()) helper_error_ = err;
+        helper_busy_ = false;
+    }
 }
 
 uint64_t Engine::expert_bytes(int il) const {
@@ -2311,6 +2440,10 @@ const Stats& Engine::stats() const {
         all_stats_.swapped_experts += s.swapped_experts;
         all_stats_.tail_experts += s.tail_experts;
         all_stats_.remote_experts += s.remote_experts;
+        all_stats_.cpu_ram_experts += s.cpu_ram_experts;
+        all_stats_.cpu_tier_experts += s.cpu_tier_experts;
+        all_stats_.cpu_file_experts += s.cpu_file_experts;
+        all_stats_.helper_swapped += s.helper_swapped;
         all_stats_.cpu_ms += s.cpu_ms;
         all_stats_.route_wait_ms += s.route_wait_ms;
     }
@@ -2465,7 +2598,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
             for (int k = 0; k < n_used_; ++k) {
                 const size_t e = (size_t) ids[k];
                 ++use_[(size_t) il * n_expert_ + e];
-                if (n_swap_ > 0) recent_[(size_t) il * n_expert_ + e] += 1.f;
+                if (!recent_.empty()) recent_[(size_t) il * n_expert_ + e] += 1.f;
                 if (const uint8_t* s = L.slot[e]) {
                     cached[n_cached++] = {s, w[k], at + t};
                     continue;
@@ -2496,6 +2629,13 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                 else host[kept++] = host[i];
             }
             n_host = kept;
+        }
+        for (int i = 0; i < n_host; ++i) {   // where the CPU reads them from: what the tiers and the helper leave
+            const uint8_t* g = host[i].gate;
+            if (ram_tier_ && g >= (const uint8_t*) ram_tier_ && g < (const uint8_t*) ram_tier_ + ram_tier_bytes_)
+                ++stats_.cpu_ram_experts;
+            else if (in_tier(g)) ++stats_.cpu_tier_experts;
+            else ++stats_.cpu_file_experts;
         }
         // The helper's experts go first, so that its GPUs work while this machine's CPU does; its answer is read
         // after the CPU's experts.  When it cannot be reached, they are computed here with the rest.
@@ -3047,7 +3187,7 @@ void Engine::run(const int32_t* tokens, int n) {
 
     // h_r_ and h_cpu_ may still be the source of the previous call's copies
     ck(cudaStreamSynchronize(cs(st_)), "eval");
-    if (n_swap_ > 0) follow(n < kStageRows ? n : 0);
+    if (n_swap_ > 0 || helper_) follow(n < kStageRows ? n : 0);
     tok_ = tokens;
     const size_t e_row = (size_t) n_embd_, r_row = (size_t) streams() * e_row;
     const float scale = embed_scale();
@@ -3267,7 +3407,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n) {
     }
 
     ck(cudaStreamSynchronize(cs(st_)), "step");
-    if (n_swap_ > 0) follow(n);
+    if (n_swap_ > 0 || helper_) follow(n);
     tok_ = tokens;
     windowed_ = false;
     snap_bits_ = 0;
@@ -3555,7 +3695,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
         throw std::runtime_error("the context is full (" + std::to_string(opt_.max_context) + " tokens)");
 
     ck(cudaStreamSynchronize(cs(st_)), "read");
-    if (n_swap_ > 0) follow(0);
+    if (n_swap_ > 0 || helper_) follow(0);
     const size_t e_row = (size_t) n_embd_, r_row = (size_t) streams() * e_row, r_bytes = r_row * sizeof(float);
     const size_t part = (size_t) std::max(streams(), draft_ ? 3 : 1) * rows_ * e_row;   // a call's rows of r_
     const float scale = embed_scale();

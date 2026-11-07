@@ -50,6 +50,12 @@ int main() {
                     std::memcpy(&e1, p.data() + sizeof(h) + xb + sizeof(Entry), sizeof(e1));
                     if (sizes && e1.expert == 7 && e1.row == 2) c.send(kOk, p.data() + sizeof(h), xb);
                     else c.send(kErr, "bad compute", 11);
+                } else if (t == kRelease) {   // gives up what it is asked to: answers the count
+                    uint32_t n = 0;
+                    if (p.size() >= 4) std::memcpy(&n, p.data(), 4);
+                    const bool sizes = p.size() == 4 + (size_t) n * sizeof(Pair);
+                    if (sizes) c.send(kOk, &n, 4);
+                    else c.send(kErr, "bad release", 11);
                 } else {
                     c.send(kErr, "no", 2);
                 }
@@ -65,6 +71,12 @@ int main() {
               "the three parts arrive whole and in order");
         c.send(kHold, nullptr, 0);
         check(c.recv(reply) == kErr && Conn::text(reply) == "no", "an Err carries its text");
+        const std::vector<Pair> drop = {{3, 5}, {9, 7}};
+        const uint32_t nd = (uint32_t) drop.size();
+        c.send(kRelease, &nd, 4, drop.data(), drop.size() * sizeof(Pair));
+        uint32_t freed = 0;
+        check(c.recv(reply) == kOk && reply.size() == 4 && (std::memcpy(&freed, reply.data(), 4), freed == 2),
+              "a Release names its pairs and is answered with a count");
         // a large message, past the socket buffers
         std::vector<float> big((size_t) 6144 * 512);
         h.rows = 512;

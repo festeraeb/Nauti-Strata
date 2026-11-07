@@ -926,15 +926,20 @@ int serve(Session& ss) {
         }
         // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused>
         //      <experts from VRAM> <experts> <RAM blobs> <file blobs> <file MB> <prompt tokens read> <offloaded>
+        //      <CPU experts from RAM> <from a tier file> <from the model's file> <experts the helper took over>
         const strata::poly::Stats& now = engine.stats();
         // the cache's share of the experts looked up while answering: a prompt batch's go through VRAM either way
         const long long hits = now.gpu_experts - before.gpu_experts;
         const long long misses = now.cpu_experts - before.cpu_experts;
         // <offloaded>: the experts another GPU computed, the expert helper's, outside the hit rate's lookups
         const long long remote = now.remote_experts - before.remote_experts;
-        std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld 0 0 0.0 %lld %lld\n", (long long) r.produced, n,
-                    r.prompt_ms, r.decode_ms, r.finish, (long long) r.guessed_right, (long long) r.guessed,
-                    (long long) r.resume, hits, hits + misses, (long long) r.read, remote);
+        std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld 0 0 0.0 %lld %lld %lld %lld %lld %lld\n",
+                    (long long) r.produced, n, r.prompt_ms, r.decode_ms, r.finish, (long long) r.guessed_right,
+                    (long long) r.guessed, (long long) r.resume, hits, hits + misses, (long long) r.read, remote,
+                    (long long) (now.cpu_ram_experts - before.cpu_ram_experts),
+                    (long long) (now.cpu_tier_experts - before.cpu_tier_experts),
+                    (long long) (now.cpu_file_experts - before.cpu_file_experts),
+                    (long long) (now.helper_swapped - before.helper_swapped));
         std::fflush(stdout);
         scraper.write(ids, resume, answer);
         if (admit >= 0) {
@@ -1012,12 +1017,15 @@ int once(Session& ss, const std::vector<int32_t>& ids, const Pictures& pictures,
     std::fprintf(stderr,
                  "prompt %lld tokens %.1f tok/s, generated %lld tokens %.2f tok/s (%s); experts from VRAM %.1f%%, "
                  "CPU experts %.1f ms/token, router wait %.1f ms/token, %lld experts swapped into VRAM, "
-                 "%lld left out, %lld of %lld guessed tokens right\n",
+                 "%lld left out, %lld of %lld guessed tokens right; the helper computed %lld and took over %lld; "
+                 "the CPU read %lld from RAM, %lld from the tier files, %lld from the model's file\n",
                  (long long) r.read, r.prompt_ms > 0 ? 1000.0 * (double) r.read / r.prompt_ms : 0.0,
                  (long long) r.produced, r.decode_ms > 0 ? 1000.0 * (double) (r.produced - 1) / r.decode_ms : 0.0,
                  r.finish, 100.0 * (double) st.gpu_experts / experts, st.cpu_ms / (double) std::max<int64_t>(st.tokens, 1),
                  st.route_wait_ms / (double) std::max<int64_t>(st.tokens, 1), (long long) st.swapped_experts,
-                 (long long) st.tail_experts, (long long) r.guessed_right, (long long) r.guessed);
+                 (long long) st.tail_experts, (long long) r.guessed_right, (long long) r.guessed,
+                 (long long) st.remote_experts, (long long) st.helper_swapped, (long long) st.cpu_ram_experts,
+                 (long long) st.cpu_tier_experts, (long long) st.cpu_file_experts);
     return 0;
 }
 
@@ -1155,6 +1163,10 @@ void usage() {
                  "                         experts after this machine's VRAM and compute them for it, a layer's in\n"
                  "                         one round trip beside the CPU's own (RAM and the tiers take the next)\n"
                  "  --expert-helper-mib N  what to ask it to hold at most, all cards together (default: all it has)\n"
+                 "  --helper-swaps N       while an answer is written, the helper's set follows it: up to N of the\n"
+                 "                         experts the answer keeps missing go over at a time, in the room of the\n"
+                 "                         ones it uses least (default 32; 0 keeps the set the profile chose, for\n"
+                 "                         parity runs, with --expert-swaps 0)\n"
                  "  --tail-skip N          an expert outside VRAM that every token of a window ranks at place N+1\n"
                  "                         or later among its experts is left out: faster, and the answers move a\n"
                  "                         little (default 0 = none is; setup gives Qwen3.6 6)\n"
@@ -1224,6 +1236,7 @@ int main(int argc, char** argv) {
         else if (a == "--expert-tier-mib") o.expert_tier_mib = std::atoi(val());
         else if (a == "--expert-helper") o.expert_helper = val();
         else if (a == "--expert-helper-mib") o.expert_helper_mib = std::atoi(val());
+        else if (a == "--helper-swaps") o.helper_swaps = std::atoi(val());
         else if (a == "--layer-split") o.layer_split = val();
         else if (a == "--batch" || a == "--slots") o.batch = std::atoi(val());
         else if (a == "--check-batch") check = std::atoi(val());

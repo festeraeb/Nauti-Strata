@@ -94,6 +94,9 @@ struct Options {
     int expert_tier_mib = 0;      ///< the experts' bytes it holds at most
     std::string expert_helper;    ///< host:port of a strata-expert-helper whose GPUs hold experts; empty: none
     int expert_helper_mib = 0;    ///< what the engine asks the helper to hold at most, all cards together; 0: all it has
+    int helper_swaps = 32;        ///< while an answer is written, the helper's set follows it: up to this many of the
+                                  ///< experts the answer keeps missing go over at a time, in the room of the ones it
+                                  ///< uses least (helper_trade()); 0: the set stays as hold_remote() chose it
 };
 
 /// A thing a model's file may call by other names than the engine does: converters differ.
@@ -149,6 +152,9 @@ struct Stats {
     int64_t swapped_experts = 0;   ///< experts that took a cached one's slot (follow())
     int64_t tail_experts = 0;      ///< a token's experts left out by Options::tail_skip
     int64_t remote_experts = 0;    ///< a token's experts the helper's GPUs computed (Options::expert_helper)
+    /// cpu_experts by where the CPU read them: the RAM tier, a tier file (the Optane), or the model's file
+    int64_t cpu_ram_experts = 0, cpu_tier_experts = 0, cpu_file_experts = 0;
+    int64_t helper_swapped = 0;    ///< experts the helper took over while answers were written (helper_follow())
     double cpu_ms = 0, route_wait_ms = 0;
 };
 
@@ -489,6 +495,12 @@ protected:
     }
     /// The helper failed: its experts are computed here from now on, from the model's file.
     void drop_helper(const char* why);
+    /// The helper's set follows the answer (helper_trade()): called from follow() with the tokens written.  Takes
+    /// what the last trade brought, then asks the helper thread for the next one.
+    void helper_follow(int written);
+    void helper_loop();          ///< the thread that sends the trades: Release, then Hold, on holder_
+    void stop_helper_thread();
+    bool in_tier(const void* p) const;   ///< p is in one of the tier files' mappings
     void start_swaps();
     void plan_ahead(Layer& L, int il);
     void run(const int32_t* tokens, int n);
@@ -787,6 +799,20 @@ protected:
     std::vector<uint8_t> remote_;        ///< per (layer, expert): the helper holds it
     int64_t remote_held_ = 0;            ///< experts it holds for this card
     std::vector<float> remote_out_;      ///< its answer, while the CPU's experts' sum is in h_cpu_
+    // The helper's set follows the answer (helper_follow()).  The engine's thread picks the trade and owns remote_;
+    // helper_thread_ sends it on holder_, the connection whose holds they are, so that a Hold's file reads on the
+    // helper never delay a Compute on helper_.
+    std::unique_ptr<RemoteHelper> holder_;
+    uint64_t remote_bytes_ = 0, remote_budget_ = 0;   ///< what the helper holds for this card, and may at most
+    std::vector<uint8_t> remote_pending_;   ///< per (layer, expert): a Hold for it is out
+    std::vector<uint64_t> helper_layer_bytes_;   ///< per layer: an expert's bytes on the helper; 0: not this card's
+    std::vector<uint8_t> vram_mask_;        ///< scratch for helper_trade(): in VRAM or on its way there
+    std::thread helper_thread_;
+    std::mutex helper_m_;
+    std::condition_variable helper_cv_;
+    bool helper_quit_ = false, helper_busy_ = false, helper_asked_ = false;
+    std::vector<std::pair<int32_t, int32_t>> helper_in_, helper_out_, helper_got_;   ///< the trade out, and its answer
+    std::string helper_error_;              ///< why the thread's last trade failed; helper_follow() drops the helper
     int64_t ram_experts_ = 0, tier_experts_ = 0;   ///< experts in each
     Stats stats_;
 };

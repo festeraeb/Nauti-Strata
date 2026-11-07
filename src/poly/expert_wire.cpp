@@ -163,6 +163,10 @@ uint32_t Conn::recv(std::vector<uint8_t>& payload, uint64_t max_bytes) {
     }
 }
 
+void Conn::shutdown() {
+    if (fd_ >= 0) ::shutdown(fd_, SHUT_RDWR);
+}
+
 std::string Conn::text(const std::vector<uint8_t>& payload) {
     return payload.empty() ? std::string("the helper refused") : std::string(payload.begin(), payload.end());
 }

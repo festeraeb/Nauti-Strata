@@ -172,13 +172,16 @@ public:
 
     void serve(wire::Conn c, std::string who) {
         std::vector<std::pair<int32_t, int32_t>> mine;   // this connection's holds, released when it ends
-        std::vector<uint8_t> p;
+        std::vector<uint8_t> p, staging;
+        bool spoke = false;   // a health probe connects and closes without a word: not worth a line
         try {
             for (;;) {
                 const uint32_t t = c.recv(p);
+                spoke = true;
                 try {
                     if (t == wire::kHello) hello(c, p);
-                    else if (t == wire::kHold) hold(c, p, mine, who);
+                    else if (t == wire::kHold) hold(c, p, mine, who, staging);
+                    else if (t == wire::kRelease) release_some(c, p, mine, who);
                     else if (t == wire::kCompute) compute(c, p);
                     else throw std::runtime_error("unknown message " + std::to_string(t));
                 } catch (const std::runtime_error& e) {
@@ -188,7 +191,7 @@ public:
                 }
             }
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "strata-expert-helper: %s: %s\n", who.c_str(), e.what());
+            if (spoke) std::fprintf(stderr, "strata-expert-helper: %s: %s\n", who.c_str(), e.what());
         }
         release(mine, who);
     }
@@ -206,14 +209,21 @@ private:
         c.send(wire::kOk, &ok, sizeof(ok));
     }
 
-    void hold(wire::Conn& c, const std::vector<uint8_t>& p, std::vector<std::pair<int32_t, int32_t>>& mine,
-              const std::string& who) {
+    static std::vector<wire::Pair> pairs_of(const std::vector<uint8_t>& p, const char* what) {
         uint32_t n = 0;
-        if (p.size() < 4) throw std::runtime_error("a Hold too short");
+        if (p.size() < 4) throw std::runtime_error(std::string("a ") + what + " too short");
         std::memcpy(&n, p.data(), 4);
-        if (p.size() != 4 + (size_t) n * sizeof(wire::Pair)) throw std::runtime_error("a Hold of the wrong size");
-        std::vector<wire::Pair> want(n), got;
-        std::memcpy(want.data(), p.data() + 4, (size_t) n * sizeof(wire::Pair));
+        if (p.size() != 4 + (size_t) n * sizeof(wire::Pair))
+            throw std::runtime_error(std::string("a ") + what + " of the wrong size");
+        std::vector<wire::Pair> q(n);
+        std::memcpy(q.data(), p.data() + 4, (size_t) n * sizeof(wire::Pair));
+        return q;
+    }
+
+    void hold(wire::Conn& c, const std::vector<uint8_t>& p, std::vector<std::pair<int32_t, int32_t>>& mine,
+              const std::string& who, std::vector<uint8_t>& staging) {
+        const std::vector<wire::Pair> want = pairs_of(p, "Hold");
+        std::vector<wire::Pair> got;
         const auto t0 = Clock::now();
         uint64_t bytes = 0;
         size_t loaded = 0;
@@ -231,22 +241,42 @@ private:
                     have = true;
                 }
             }
-            if (!have && !load(q.layer, q.expert)) continue;   // no device has room for it
+            if (!have && !load(q.layer, q.expert, staging)) continue;   // no device has room for it
             if (!have) ++loaded;
             mine.push_back(key);
             got.push_back(q);
             bytes += m_.expert_bytes(q.layer);
         }
         const double s = std::chrono::duration<double>(Clock::now() - t0).count();
-        std::fprintf(stderr, "strata-expert-helper: %s: holds %zu of %u experts asked for (%llu MiB, %zu read from "
+        std::fprintf(stderr, "strata-expert-helper: %s: holds %zu of %zu experts asked for (%llu MiB, %zu read from "
                              "the file in %.1f s)\n",
-                     who.c_str(), got.size(), n, (unsigned long long) (bytes >> 20), loaded, s);
+                     who.c_str(), got.size(), want.size(), (unsigned long long) (bytes >> 20), loaded, s);
         const uint32_t m = (uint32_t) got.size();
         c.send(wire::kOk, &m, 4, got.data(), got.size() * sizeof(wire::Pair));
     }
 
+    // Release: the connection gives up some of its holds before it ends, so that its engine can take others in
+    // their room (the set follows the answer).  Answers how many were its to give.
+    void release_some(wire::Conn& c, const std::vector<uint8_t>& p, std::vector<std::pair<int32_t, int32_t>>& mine,
+                      const std::string& who) {
+        std::vector<std::pair<int32_t, int32_t>> drop;
+        for (const wire::Pair& q : pairs_of(p, "Release")) {
+            const auto key = std::make_pair(q.layer, q.expert);
+            const auto it = std::find(mine.begin(), mine.end(), key);
+            if (it == mine.end()) continue;   // not this connection's: nothing to give
+            mine.erase(it);
+            drop.push_back(key);
+        }
+        release(drop, who);
+        const uint32_t m = (uint32_t) drop.size();
+        c.send(wire::kOk, &m, 4);
+    }
+
     // Reads an expert into the device with the most room for it, with a reference.  False: none has room.
-    bool load(int il, int e) {
+    // The file's bytes come into `staging` first, outside any lock: a miss in the page cache is a disk read (77 ms
+    // an expert from a SAS SSD), and a Compute on the device must not wait for it.  The copy to the device then
+    // holds the device for its own time only.
+    bool load(int il, int e, std::vector<uint8_t>& staging) {
         const LayerW& L = m_.layers[(size_t) il];
         const size_t bytes = m_.expert_bytes(il) + kPad;
         Device* best = nullptr;
@@ -261,15 +291,17 @@ private:
         const uint8_t* gate = L.gate + (size_t) e * L.gu_stride;
         const uint8_t* up = L.up + (size_t) e * L.gu_stride;
         const uint8_t* down = L.down + (size_t) e * L.d_bytes;
+        staging.resize(bytes);
+        std::memcpy(staging.data(), gate, L.gu_bytes);
+        std::memcpy(staging.data() + L.gu_bytes, up, L.gu_bytes);
+        std::memcpy(staging.data() + 2 * L.gu_bytes, down, L.d_bytes);
+        std::memset(staging.data() + 2 * L.gu_bytes + L.d_bytes, 0, kPad);
         uint8_t* w = nullptr;
         try {
             std::lock_guard<std::mutex> dl(best->mu);
             ck(cudaSetDevice(best->id), "cudaSetDevice");
             ck(cudaMalloc(&w, bytes), "cudaMalloc");
-            ck(cudaMemcpy(w, gate, L.gu_bytes, cudaMemcpyHostToDevice), "upload");
-            ck(cudaMemcpy(w + L.gu_bytes, up, L.gu_bytes, cudaMemcpyHostToDevice), "upload");
-            ck(cudaMemcpy(w + 2 * L.gu_bytes, down, L.d_bytes, cudaMemcpyHostToDevice), "upload");
-            ck(cudaMemset(w + 2 * L.gu_bytes + L.d_bytes, 0, kPad), "upload");
+            ck(cudaMemcpy(w, staging.data(), bytes, cudaMemcpyHostToDevice), "upload");
         } catch (const std::runtime_error& err) {
             if (w) cudaFree(w);
             std::lock_guard<std::mutex> lk(mu_);
@@ -310,7 +342,7 @@ private:
             held_.erase(it);
         }
         if (!mine.empty())
-            std::fprintf(stderr, "strata-expert-helper: %s ended: %zu experts freed (%llu MiB)\n", who.c_str(), freed,
+            std::fprintf(stderr, "strata-expert-helper: %s: %zu experts freed (%llu MiB)\n", who.c_str(), freed,
                          (unsigned long long) (bytes >> 20));
     }
 

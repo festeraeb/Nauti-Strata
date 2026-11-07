@@ -114,6 +114,8 @@ public:
     ExpertTier& operator=(const ExpertTier&) = delete;
 
     bool mapped() const { return map_ != nullptr; }
+    /// True when p points into this tier's mapping (an expert's bytes are read from it).
+    bool holds(const void* p) const { return map_ && p >= map_ && p < (const void*) ((const uint8_t*) map_ + map_bytes_); }
     size_t count() const { return entries_.size(); }
     uint64_t data_bytes() const { return header_.data_bytes; }
     uint64_t profile_id() const { return header_.profile_id; }

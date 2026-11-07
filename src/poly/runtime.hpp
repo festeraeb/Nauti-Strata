@@ -2,6 +2,7 @@
 #pragma once
 
 #include "engine.hpp"
+#include "expert_follow.hpp"   // kSwapMin, kSwapHalf: the cache and the helper follow by one rule
 
 #include "strata/artifact/gguf_reader.hpp"
 
@@ -38,11 +39,6 @@ constexpr size_t kChunkBytes = size_t(512) << 20;   // one upload, and each of t
 // Zero bytes behind every matrix the batched kernels may multiply (Mmq::fits): they read up to a step of 256
 // columns past a row that ends inside one, which is at most 7 blocks of 34 bytes.
 constexpr size_t kTail = 256;
-// follow(): an expert's recent use is the count of its uses, halved every kSwapHalf tokens.  An expert takes a
-// cached one's slot when it was used twice lately and more than twice as much as that one.  Counts this small are
-// noisy, and an upload gets in the way of the work: a slot goes to an expert that will clearly be used more.
-constexpr float kSwapMin = 2.f;
-constexpr int kSwapHalf = 128;
 // Engine::pick_way(): each way of a window is timed this many times before the faster one is taken.  What a way
 // takes moves, most in an answer's first windows, while the cache comes to hold the answer's experts, so the way
 // behind is timed again after kWayAgain windows of that size, then after twice as many each time it is still

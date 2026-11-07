@@ -24,11 +24,15 @@ public:
 
     /// Asks the helper to hold `want` (warmest first); returns those it holds.
     std::vector<std::pair<int32_t, int32_t>> hold(const std::vector<std::pair<int32_t, int32_t>>& want);
+    /// Gives up `drop` of this connection's holds; returns how many the helper let go.
+    uint32_t release(const std::vector<std::pair<int32_t, int32_t>>& drop);
 
     /// One layer's experts for `rows` tokens: x is rows * n_embd inputs, entries the held experts routed to.
     void send(int layer, int rows, float limit, bool gelu, const float* x, const wire::Entry* entries, int n);
     /// The answer to the send() before: rows * n_embd weighted sums into out.
     void recv(float* out, int rows);
+    /// From another thread: ends the connection, so a blocked hold() or recv() returns with an error.
+    void abort() { c_.shutdown(); }
 
 private:
     std::string addr_;

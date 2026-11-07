@@ -12,11 +12,14 @@
 //   engine -> helper                              helper -> engine
 //   Hello  {Hello}                                Ok {HelloOk}                  or Err {text}
 //   Hold   {u32 n}{Pair x n}                      Ok {u32 n}{Pair x n} (held)   or Err
+//   Release {u32 n}{Pair x n}                     Ok {u32 n} (of this connection's holds, given up)  or Err
 //   Compute {ComputeHead}{f32 x rows*n_embd}      Ok {f32 rows*n_embd}          or Err
 //           {Entry x n}
 //
 // A connection's holds end with it: an engine that restarts asks again, and the helper frees what no
-// connection holds.
+// connection holds.  An engine keeps two connections: one that holds and releases while an answer is written,
+// so that the helper's set follows the answer (Engine::follow()), and one that computes, which a Hold's file
+// reads then never delay.
 #pragma once
 
 #include <cstddef>
@@ -29,7 +32,7 @@ namespace strata::poly::wire {
 constexpr uint32_t kMagic = 0x31485853;   // "SXH1"
 constexpr uint32_t kGelu = 1;             // ComputeHead::flags: gelu(gate) * up, not silu with the clamp
 
-enum Type : uint32_t { kHello = 1, kHold = 2, kCompute = 3, kOk = 8, kErr = 9 };
+enum Type : uint32_t { kHello = 1, kHold = 2, kCompute = 3, kRelease = 4, kOk = 8, kErr = 9 };
 
 struct Head {
     uint32_t magic;
@@ -99,6 +102,8 @@ public:
 
     bool open() const { return fd_ >= 0; }
     void close();
+    /// From another thread: a recv() blocked on this connection returns with an error, and it is of no further use.
+    void shutdown();
 
 private:
     int fd_ = -1;

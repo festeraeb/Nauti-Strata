@@ -1118,6 +1118,9 @@ class StrataEngine:
             self.last.update(prompt_read=int(f[14]))
         if len(f) >= 16:                                  # #588 (engine 0.1.39+): routed experts read over PCIe
             self.last.update(offloaded=int(f[15]))
+        if len(f) >= 20:                                  # where the CPU read its experts, and the helper's takes
+            self.last.update(cpu_ram=int(f[16]), cpu_tier=int(f[17]), cpu_file=int(f[18]),
+                             helper_swaps=int(f[19]))
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
@@ -4793,6 +4796,10 @@ class Service:
                                 if n and last.get("generated") and last.get("decode_ms") else None,
                                 "hit_rate": hit_rate, "pcie_share": pcie_share, "ram_blobs": last.get("ram_blobs"),
                                 "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
+                                # the CPU's experts by source (RAM tier, tier files, the model's file) and the
+                                # experts the helper took over while answering (None: an older engine)
+                                "cpu_ram": last.get("cpu_ram"), "cpu_tier": last.get("cpu_tier"),
+                                "cpu_file": last.get("cpu_file"), "helper_swaps": last.get("helper_swaps"),
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
                                 "drafts_accepted": last.get("drafts_accepted")})
@@ -4820,6 +4827,9 @@ class Service:
                             hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
                             if hit_msg and pcie_share:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
+                            if last.get("cpu_file") is not None:
+                                hit_msg += (f"; CPU misses from RAM {last['cpu_ram']} / tier {last['cpu_tier']} / "
+                                            f"file {last['cpu_file']}; the helper took over {last['helper_swaps']}")
                             print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                             if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
