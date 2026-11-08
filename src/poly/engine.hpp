@@ -106,6 +106,11 @@ struct Options {
                                   ///< window, kCpuRows x the experts a token
     int helper_ram_mib = 0;       ///< what the engine asks the helper to hold in RAM at most, all cards together;
                                   ///< 0: all its window has
+    int helper_ram_after = 0;     ///< where the helper's RAM ranks among this machine's tiers: 0 before its RAM tier
+                                  ///< (the plan's order), 1 after it, 2 after the tier files too.  After, the
+                                  ///< warmest misses stay local (RAM ~0 ms, Optane) and the window takes what
+                                  ///< would be read from the file (8 ms by RDMA instead of 72 ms from t440's SSD);
+                                  ///< with 2, HELPER ram 0 leaves every expert where a load without it puts it
 };
 
 /// A thing a model's file may call by other names than the engine does: converters differ.

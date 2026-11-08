@@ -1225,6 +1225,9 @@ void usage() {
                  "                         miss on one is an RDMA READ of its bytes, computed on this CPU\n"
                  "  --helper-ram-mib N     what to ask it to hold in RAM at most, all cards together (default: all\n"
                  "                         its window has)\n"
+                 "  --helper-ram-after WHAT  the helper's RAM takes the warmest after this machine's RAM tier (ram)\n"
+                 "                         or after its tier files too (tiers), instead of before them (none,\n"
+                 "                         the default)\n"
                  "  --rdma-inflight N      RDMA READs outstanding at a time, a card (default 16)\n"
                  "  --rdma-slots N         staging slots a card, each the largest expert (default: 8 x the experts\n"
                  "                         a token, one a possible miss of a window)\n"
@@ -1302,6 +1305,14 @@ int main(int argc, char** argv) {
         else if (a == "--rdma-inflight") o.rdma_inflight = std::atoi(val());
         else if (a == "--rdma-slots") o.rdma_slots = std::atoi(val());
         else if (a == "--helper-ram-mib") o.helper_ram_mib = std::atoi(val());
+        else if (a == "--helper-ram-after") {
+            const std::string v = val();
+            o.helper_ram_after = v == "ram" ? 1 : v == "tiers" ? 2 : v == "none" ? 0 : -1;
+            if (o.helper_ram_after < 0) {
+                std::fprintf(stderr, "--helper-ram-after: none, ram or tiers\n");
+                return 2;
+            }
+        }
         else if (a == "--layer-split") o.layer_split = val();
         else if (a == "--batch" || a == "--slots") o.batch = std::atoi(val());
         else if (a == "--check-batch") check = std::atoi(val());

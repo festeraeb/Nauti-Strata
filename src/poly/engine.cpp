@@ -2247,8 +2247,44 @@ void Engine::hold_remote() {
         take_held(holder_->hold(warmest(dev_budget), wire::kDeviceOnly), refuse, false);
         const int64_t on_device = remote_held_;
         const uint64_t dev_bytes = remote_bytes_;
-        // the next warmest in RAM: tier_order() leaves out what the devices took
-        if (ram_budget_ > 0) take_held(holder_->hold(warmest(ram_budget_), wire::kRamOnly), refuse, false);
+        // the next warmest in RAM: tier_order() leaves out what the devices took.  helper_ram_after: after the
+        // ones this machine's RAM tier will take (build_tiers(): in heat order up to the first that does not fit),
+        // and with 2 after the tier files' too (tier_want(): in heat order, skipping one too large for what is left)
+        if (ram_budget_ > 0) {
+            std::vector<std::pair<int32_t, int32_t>> want;
+            if (opt_.helper_ram_after > 0) {
+                const std::vector<std::pair<int32_t, int32_t>> order = tier_order(counts, false);
+                std::vector<uint8_t> local(order.size(), 0);
+                const uint64_t cap = (uint64_t) ((double) ((uint64_t) std::max(opt_.ram_experts_mib, 0) << 20) *
+                                                 tier_share());
+                uint64_t used = 0;
+                size_t i = 0;
+                for (; i < order.size() && used + expert_bytes(order[i].first) <= cap; ++i) {
+                    used += expert_bytes(order[i].first);
+                    local[i] = 1;
+                }
+                if (opt_.helper_ram_after > 1) {
+                    const uint64_t tcap = tier_capacity();
+                    used = 0;
+                    for (; i < order.size(); ++i) {
+                        const uint64_t b = expert_bytes(order[i].first);
+                        if (used + b > tcap) continue;
+                        used += b;
+                        local[i] = 1;
+                    }
+                }
+                used = 0;
+                for (size_t k = 0; k < order.size(); ++k) {
+                    const uint64_t b = expert_bytes(order[k].first) + 256;
+                    if (local[k] || used + b > ram_budget_) continue;
+                    want.push_back(order[k]);
+                    used += b;
+                }
+            } else {
+                want = warmest(ram_budget_);
+            }
+            take_held(holder_->hold(want, wire::kRamOnly), refuse, false);
+        }
         if (!refuse.empty()) holder_->release(refuse);
         std::fprintf(stderr, "expert helper: %lld experts (%llu MiB) on %s, %d GPU(s) there, %lld (%llu MiB) in its "
                              "RAM, in %.1f s%s\n",
