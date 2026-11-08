@@ -76,3 +76,33 @@ bottleneck. Verdict: GO. The RAM tier removes SSD reads; where it lives changes 
   proves the path (t440's RAM is the helper's and the fleet's); c1 over 1 GbE (112 MB/s) would be slower than the SSD.
 - The helper therefore becomes host-agnostic: `--devices` may be empty (RAM-only helper on c1), and the engine takes
   several `--expert-helper` entries later (t440's VRAM helper + c1's RAM helper); first one helper with both kinds.
+
+## Built and measured (2026-11-08, Fable subagent)
+Commits 74cafb07 (wire v2, helper RAM window, expert_rdma), ea30ced0 (engine read path), 18212fc7
+(--helper-ram-after).  Seats: ml4-helper-t440 `--ram-mib 16384 --rdma rocep1s0f1:1:3`; le-chonk-c4 `--rdma-dev
+rocep135s0f1:1:5 --helper-ram-mib 16384 --helper-ram-after tiers`.
+
+- The link: one 23 MiB RDMA READ t440 -> c4 7.91 ms (3.05 GB/s; ib_read_lat 7.88).  In the live engine a miss costs
+  8.5-13 ms (27 MiB experts, one READ a layer a token, little to overlap), against ~72 ms from t440's SSD.
+- Parity (plan order, `--expert-swaps 0 --helper-swaps 0`): the 20-token prompt's 24 tokens identical on and off;
+  the 96-token probe's decode identical (96/96) on and off from the same prompt state.  Fresh 34-token prompts part
+  at token ~30 on both sides of the switch alike: the batched prompt path splits CPU/GPU by measured time
+  (`--cpu-share -1`) and does not read by RDMA.  Strict fresh-prompt parity needs `--cpu-share` > 0.
+- Speed (live swaps, cap 8, `--helper-ram-after tiers`, one loaded state, the 96-token probe, HELPER ram between
+  requests; probes 2-6 reuse the prompt's KV):
+
+| probe | RAM reads | decode tok/s | VRAM hit | CPU misses RAM / tier / file / helper RAM | RDMA ms a miss | ssd9 read |
+|---|---|---|---|---|---|---|
+| 1 | off | 0.122 | 43.3% | 5004 / 1084 / 6267 / 0 | - | 261 GiB |
+| 2 | on | 0.189 | 60.8% | 1995 / 429 / 3828 / 2280 | 11.6 | 126 GiB |
+| 3 | off | 0.206 | 64.0% | 2431 / 562 / 4903 / 0 | - | 113 GiB |
+| 4 | on | 0.261 | 65.1% | 1611 / 286 / 3319 / 2676 | 10.5 | 87 GiB |
+| 5 | off | 0.216 | 66.0% | 2279 / 467 / 4730 / 0 | - | 108 GiB |
+| 6 | on | 0.288 | 65.2% | 1521 / 271 / 3129 / 2673 | 10.3 | 78 GiB |
+
+  At the same cache state (3-6) the window gives +27% and +34% decode and ~30% fewer SSD bytes.  ssd9 still runs at
+  its ~255 MB/s ceiling: read-ahead on the NFS mmap reads more than the misses need.
+- Open: the trade (kAny) can move an expert from c4's RAM tier into the helper's RAM (local -> 10 ms); a trade should
+  ask device-only for experts a local tier holds.  The RDMA wait is not overlapped with the CPU's file experts.
+- For c1: several `--expert-helper` entries (t440 VRAM + c1 RAM), a RAM-only helper (`--devices ""`, tested with
+  Qwen3.6 and Le Chonk experts), the per-peer path selector (rdma > nfs-mmap > tcp) and the route::select hook.
