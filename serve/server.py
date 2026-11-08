@@ -1121,6 +1121,8 @@ class StrataEngine:
         if len(f) >= 20:                                  # where the CPU read its experts, and the helper's takes
             self.last.update(cpu_ram=int(f[16]), cpu_tier=int(f[17]), cpu_file=int(f[18]),
                              helper_swaps=int(f[19]))
+        if len(f) >= 23:                                  # the experts read by RDMA from the helper's RAM, those
+            self.last.update(cpu_rdma=int(f[20]), rdma_ms=float(f[21]), rdma_wait_ms=float(f[22]))   # reads' ms
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
@@ -1153,13 +1155,18 @@ class StrataEngine:
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
 
-    def helper_swaps(self, swaps: int | None, timeout: float = 30.0) -> dict:
+    def helper_swaps(self, swaps: int | None, timeout: float = 30.0, ram: bool | None = None) -> dict:
         """`HELPER [n]` between requests: the expert helper's set takes over up to n experts a token from now on
-        (0: it stays as it is); None asks the current value.  -> {"helper_swaps": n}; ValueError with the engine's
-        reason (no helper), EngineDied when it ended."""
+        (0: it stays as it is); None asks the current value.  `ram`: `HELPER ram 0|1`, misses on the experts in the
+        helper's RAM read by RDMA (True) or from the file (False), the holds kept.  -> {"helper_swaps": n, "ram": ...,
+        "on_device", "in_ram", "device_mib", "ram_mib"}; ValueError with the engine's reason (no helper, no RAM
+        reads), EngineDied when it ended."""
         if not self.alive():
             raise EngineDied("the engine is not running")
-        self.proc.stdin.write("HELPER" + ("" if swaps is None else f" {int(swaps)}") + "\n")
+        if ram is not None:
+            self.proc.stdin.write(f"HELPER ram {1 if ram else 0}\n")
+        else:
+            self.proc.stdin.write("HELPER" + ("" if swaps is None else f" {int(swaps)}") + "\n")
         self.proc.stdin.flush()
         deadline = time.time() + timeout
         while True:
@@ -1178,6 +1185,8 @@ class StrataEngine:
                     k, _, v = kv.partition("=")
                     out[k] = int(v) if v.lstrip("-").isdigit() else v
                 self.info["helper_swaps"] = out.get("helper_swaps")
+                if "ram" in out:
+                    self.info["helper_ram"] = out.get("ram")
                 return out
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the HELPER command")
@@ -3676,9 +3685,11 @@ class Service:
 
     vram_wait_s = 300.0                                  # #533: how long POST /v1/vram waits for a running request
 
-    def helper(self, swaps: int | None) -> dict:
-        """POST /v1/helper {"swaps": n}: the expert helper's set takes over up to n experts a token from now on (0: it
-        stays as it is; null: report), applied between requests as /v1/vram is.  -> {"status": "ok", "helper_swaps": n}."""
+    def helper(self, swaps: int | None, ram: bool | None = None) -> dict:
+        """POST /v1/helper {"swaps": n} or {"ram": true|false}: the expert helper's set takes over up to n experts a
+        token from now on (0: it stays as it is; null: report), or misses on the experts in the helper's RAM are read
+        from there by RDMA (true) or from the file (false), applied between requests as /v1/vram is.
+        -> {"status": "ok", "helper_swaps": n, "ram": -1|0|1, and the helper's holds}."""
         if not hasattr(self.engine, "helper_swaps"):
             raise ValueError("this engine has no expert helper control")
         if not self.fifo.acquire(timeout=self.vram_wait_s):
@@ -3686,9 +3697,9 @@ class Service:
         try:
             if not self.loaded():
                 raise ValueError("the model is not loaded")
-            out = self.engine.helper_swaps(swaps)
-            print(f"[strata] HELPER: the helper's set takes over up to {out.get('helper_swaps')} experts a token",
-                  flush=True)
+            out = self.engine.helper_swaps(swaps, ram=ram) if ram is not None else self.engine.helper_swaps(swaps)
+            print(f"[strata] HELPER: the helper's set takes over up to {out.get('helper_swaps')} experts a token; "
+                  f"RAM reads {out.get('ram')}, {out.get('in_ram')} experts in its RAM", flush=True)
             return {"status": "ok", **out}
         finally:
             self.fifo.release()
@@ -4846,6 +4857,9 @@ class Service:
                                 # experts the helper took over while answering (None: an older engine)
                                 "cpu_ram": last.get("cpu_ram"), "cpu_tier": last.get("cpu_tier"),
                                 "cpu_file": last.get("cpu_file"), "helper_swaps": last.get("helper_swaps"),
+                                # read by RDMA from the helper's RAM, and those reads' ms (None: an older engine)
+                                "cpu_rdma": last.get("cpu_rdma"), "rdma_ms": last.get("rdma_ms"),
+                                "rdma_wait_ms": last.get("rdma_wait_ms"),
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
                                 "drafts_accepted": last.get("drafts_accepted")})
@@ -4875,7 +4889,12 @@ class Service:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
                             if last.get("cpu_file") is not None:
                                 hit_msg += (f"; CPU misses from RAM {last['cpu_ram']} / tier {last['cpu_tier']} / "
-                                            f"file {last['cpu_file']}; the helper took over {last['helper_swaps']}")
+                                            f"file {last['cpu_file']}")
+                                if last.get("cpu_rdma") is not None:
+                                    per = (last["rdma_ms"] / last["cpu_rdma"]) if last["cpu_rdma"] else 0.0
+                                    hit_msg += (f" / helper RAM {last['cpu_rdma']} (RDMA {last['rdma_ms']:.0f} ms, "
+                                                f"waited {last['rdma_wait_ms']:.0f} ms, {per:.1f} ms a miss)")
+                                hit_msg += f"; the helper took over {last['helper_swaps']}"
                             print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                             if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
@@ -5912,8 +5931,11 @@ def make_handler(svc: Service):
                     r = req.get("swaps")
                     if r is not None and (isinstance(r, bool) or not isinstance(r, int) or r < 0):
                         raise ValueError("swaps: a whole number (0 or more), or null to ask")
+                    ram = req.get("ram")
+                    if ram is not None and not isinstance(ram, bool):
+                        raise ValueError("ram: true (read the helper's RAM by RDMA) or false (from the file)")
                     try:
-                        self._json(200, svc.helper(r))
+                        self._json(200, svc.helper(r, ram))
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return

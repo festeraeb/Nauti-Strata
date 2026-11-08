@@ -841,24 +841,48 @@ int serve(Session& ss) {
             continue;
         }
         // HELPER [n], the server's POST /v1/helper: the expert helper's set takes over up to n experts a token
-        // from now on (0: it stays as it is); alone, a report.  Between requests, as VRAM.
+        // from now on (0: it stays as it is); HELPER ram 0|1: misses on the experts in the helper's RAM are read from
+        // the file (0) or by RDMA from there (1), the holds kept either way; alone, a report.  Between requests, as
+        // VRAM.  The answer: HELPER helper_swaps=n ram=-1|0|1 on_device=n in_ram=n device_mib=n ram_mib=n
         if (line.rfind("HELPER", 0) == 0 && (line.size() == 6 || line[6] == ' ')) {
             if (writing()) {
                 std::printf("ERR HELPER: not while batch slots are writing\n");
                 std::fflush(stdout);
                 continue;
             }
-            const bool bare = line.find_first_not_of(' ', 6) == std::string::npos;
-            char* end = nullptr;
-            const long long n = bare ? -1 : std::strtoll(line.c_str() + 6, &end, 10);
-            if (!bare && (end == line.c_str() + 6 || n < 0 || n > 4096)) {
-                std::printf("ERR expected: HELPER [swaps 0..4096]\n");
+            const size_t arg = line.find_first_not_of(' ', 6);
+            const bool bare = arg == std::string::npos;
+            bool bad = false;
+            if (!bare && line.compare(arg, 3, "ram") == 0) {
+                const std::string v = line.substr(line.find_first_not_of(' ', arg + 3) == std::string::npos
+                                                      ? line.size() : line.find_first_not_of(' ', arg + 3));
+                if (v != "0" && v != "1") bad = true;
+                else if (engine.set_helper_ram(v == "1") < 0) {
+                    std::printf("ERR HELPER: no card reads the helper's RAM (--rdma-dev, and a helper with --ram-mib "
+                                "--rdma)\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+            } else if (!bare) {
+                char* end = nullptr;
+                const long long n = std::strtoll(line.c_str() + 6, &end, 10);
+                if (end == line.c_str() + 6 || n < 0 || n > 4096) bad = true;
+                else engine.set_helper_swaps((int) n);
+            }
+            if (bad) {
+                std::printf("ERR expected: HELPER [swaps 0..4096] or HELPER ram 0|1\n");
                 std::fflush(stdout);
                 continue;
             }
-            const int now = bare ? engine.helper_swaps() : engine.set_helper_swaps((int) n);
-            if (now < 0) std::printf("ERR HELPER: this engine has no expert helper\n");
-            else std::printf("HELPER helper_swaps=%d\n", now);
+            const int now = engine.helper_swaps();
+            if (now < 0) {
+                std::printf("ERR HELPER: this engine has no expert helper\n");
+            } else {
+                const strata::poly::Engine::HelperFigures f = engine.helper_figures();
+                std::printf("HELPER helper_swaps=%d ram=%d on_device=%lld in_ram=%lld device_mib=%lld ram_mib=%lld\n",
+                            now, f.ram, (long long) f.on_device, (long long) f.in_ram, (long long) f.device_mib,
+                            (long long) f.ram_mib);
+            }
             std::fflush(stdout);
             continue;
         }
@@ -949,19 +973,24 @@ int serve(Session& ss) {
         // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused>
         //      <experts from VRAM> <experts> <RAM blobs> <file blobs> <file MB> <prompt tokens read> <offloaded>
         //      <CPU experts from RAM> <from a tier file> <from the model's file> <experts the helper took over>
+        //      <CPU experts read by RDMA from the helper's RAM> <those reads' ms, first post to last completion>
+        //      <the ms this engine waited for them>
         const strata::poly::Stats& now = engine.stats();
         // the cache's share of the experts looked up while answering: a prompt batch's go through VRAM either way
         const long long hits = now.gpu_experts - before.gpu_experts;
         const long long misses = now.cpu_experts - before.cpu_experts;
         // <offloaded>: the experts another GPU computed, the expert helper's, outside the hit rate's lookups
         const long long remote = now.remote_experts - before.remote_experts;
-        std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld 0 0 0.0 %lld %lld %lld %lld %lld %lld\n",
+        std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld 0 0 0.0 %lld %lld %lld %lld %lld %lld %lld "
+                    "%.1f %.1f\n",
                     (long long) r.produced, n, r.prompt_ms, r.decode_ms, r.finish, (long long) r.guessed_right,
                     (long long) r.guessed, (long long) r.resume, hits, hits + misses, (long long) r.read, remote,
                     (long long) (now.cpu_ram_experts - before.cpu_ram_experts),
                     (long long) (now.cpu_tier_experts - before.cpu_tier_experts),
                     (long long) (now.cpu_file_experts - before.cpu_file_experts),
-                    (long long) (now.helper_swapped - before.helper_swapped));
+                    (long long) (now.helper_swapped - before.helper_swapped),
+                    (long long) (now.cpu_rdma_experts - before.cpu_rdma_experts), now.rdma_ms - before.rdma_ms,
+                    now.rdma_wait_ms - before.rdma_wait_ms);
         std::fflush(stdout);
         scraper.write(ids, resume, answer);
         if (admit >= 0) {
@@ -1040,14 +1069,16 @@ int once(Session& ss, const std::vector<int32_t>& ids, const Pictures& pictures,
                  "prompt %lld tokens %.1f tok/s, generated %lld tokens %.2f tok/s (%s); experts from VRAM %.1f%%, "
                  "CPU experts %.1f ms/token, router wait %.1f ms/token, %lld experts swapped into VRAM, "
                  "%lld left out, %lld of %lld guessed tokens right; the helper computed %lld and took over %lld; "
-                 "the CPU read %lld from RAM, %lld from the tier files, %lld from the model's file\n",
+                 "the CPU read %lld from RAM, %lld from the tier files, %lld from the model's file, %lld by RDMA from "
+                 "the helper's RAM (%lld reads, %.2f ms each)\n",
                  (long long) r.read, r.prompt_ms > 0 ? 1000.0 * (double) r.read / r.prompt_ms : 0.0,
                  (long long) r.produced, r.decode_ms > 0 ? 1000.0 * (double) (r.produced - 1) / r.decode_ms : 0.0,
                  r.finish, 100.0 * (double) st.gpu_experts / experts, st.cpu_ms / (double) std::max<int64_t>(st.tokens, 1),
                  st.route_wait_ms / (double) std::max<int64_t>(st.tokens, 1), (long long) st.swapped_experts,
                  (long long) st.tail_experts, (long long) r.guessed_right, (long long) r.guessed,
                  (long long) st.remote_experts, (long long) st.helper_swapped, (long long) st.cpu_ram_experts,
-                 (long long) st.cpu_tier_experts, (long long) st.cpu_file_experts);
+                 (long long) st.cpu_tier_experts, (long long) st.cpu_file_experts, (long long) st.cpu_rdma_experts,
+                 (long long) st.rdma_reads, st.rdma_reads > 0 ? st.rdma_ms / (double) st.rdma_reads : 0.0);
     return 0;
 }
 
@@ -1189,6 +1220,14 @@ void usage() {
                  "                         experts the answer keeps missing go over at a time, in the room of the\n"
                  "                         ones it uses least (default 8; 0 keeps the set the profile chose, for\n"
                  "                         parity runs, with --expert-swaps 0)\n"
+                 "  --rdma-dev DEV:PORT:GID  this machine's RoCE port (c4: rocep135s0f1:1:5): the helper also holds\n"
+                 "                         experts in its RAM window (strata-expert-helper --ram-mib --rdma), and a\n"
+                 "                         miss on one is an RDMA READ of its bytes, computed on this CPU\n"
+                 "  --helper-ram-mib N     what to ask it to hold in RAM at most, all cards together (default: all\n"
+                 "                         its window has)\n"
+                 "  --rdma-inflight N      RDMA READs outstanding at a time, a card (default 16)\n"
+                 "  --rdma-slots N         staging slots a card, each the largest expert (default: 8 x the experts\n"
+                 "                         a token, one a possible miss of a window)\n"
                  "  --tail-skip N          an expert outside VRAM that every token of a window ranks at place N+1\n"
                  "                         or later among its experts is left out: faster, and the answers move a\n"
                  "                         little (default 0 = none is; setup gives Qwen3.6 6)\n"
@@ -1259,6 +1298,10 @@ int main(int argc, char** argv) {
         else if (a == "--expert-helper") o.expert_helper = val();
         else if (a == "--expert-helper-mib") o.expert_helper_mib = std::atoi(val());
         else if (a == "--helper-swaps") o.helper_swaps = std::atoi(val());
+        else if (a == "--rdma-dev") o.rdma_dev = val();
+        else if (a == "--rdma-inflight") o.rdma_inflight = std::atoi(val());
+        else if (a == "--rdma-slots") o.rdma_slots = std::atoi(val());
+        else if (a == "--helper-ram-mib") o.helper_ram_mib = std::atoi(val());
         else if (a == "--layer-split") o.layer_split = val();
         else if (a == "--batch" || a == "--slots") o.batch = std::atoi(val());
         else if (a == "--check-batch") check = std::atoi(val());

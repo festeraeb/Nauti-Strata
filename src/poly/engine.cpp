@@ -3,6 +3,7 @@
 #include "engine.hpp"
 
 #include "expert_follow.hpp"
+#include "expert_rdma.hpp"
 
 #include "deepseek4.hpp"
 #include "mistral_large4.hpp"
@@ -2097,60 +2098,174 @@ void Engine::build_tiers() {
     }
 }
 
-// The helper holds this card's warmest experts after VRAM's, by the profile, in its share of the helper's room.
+// RDMA to the helper's RAM window: this card's port, one queue pair connected through holder_, and the staging
+// slots a window's RAM-held misses are read into, pinned and registered once.
+struct Engine::RdmaPath {
+    std::unique_ptr<rdma::Device> dev;
+    std::unique_ptr<rdma::Qp> qp;   // after dev: destroyed before it
+    rdma::Device::Mr mr;
+    uint8_t* stage = nullptr;
+    size_t stage_bytes = 0, slot_bytes = 0;
+    int slots = 0, inflight = 1;
+    uint32_t rkey = 0;
+    uint64_t base = 0, bytes = 0;   // the helper's window: every RAM hold's address is in it
+    // a window's reads under way (rdma_post(), rdma_wait())
+    std::vector<int32_t> slot_of;   // per expert of the layer: its slot this window, or -1
+    std::vector<int32_t> order;     // the experts read, in slot order
+    int posted = 0, done = 0;
+    std::chrono::steady_clock::time_point t0;
+
+    bool holds(const void* p) const { return stage && p >= stage && p < stage + stage_bytes; }
+    ~RdmaPath() {
+        qp.reset();
+        if (dev) rdma::Device::dereg(mr);
+        if (stage) {
+            munlock(stage, stage_bytes);
+            std::free(stage);
+        }
+    }
+};
+
+void Engine::setup_rdma() {
+    if (!holder_->has_rdma() || holder_->ram_capacity() == 0)
+        throw std::runtime_error("the helper has no RDMA-readable RAM window (strata-expert-helper --ram-mib --rdma)");
+    auto r = std::make_unique<RdmaPath>();
+    r->dev = std::make_unique<rdma::Device>(rdma::parse_port(opt_.rdma_dev));
+    r->inflight = std::max(1, opt_.rdma_inflight);
+    r->qp = std::make_unique<rdma::Qp>(*r->dev, r->inflight);
+    r->slots = opt_.rdma_slots > 0 ? opt_.rdma_slots : kCpuRows * n_used_;
+    for (int il = 0; il < (int) layers_.size(); ++il)
+        if (layers_[(size_t) il].moe && runs(il)) r->slot_bytes = std::max<size_t>(r->slot_bytes, expert_bytes(il));
+    r->slot_bytes = (r->slot_bytes + 4095) / 4096 * 4096;
+    r->stage_bytes = (size_t) r->slots * r->slot_bytes;
+    void* buf = nullptr;
+    if (posix_memalign(&buf, 4096, r->stage_bytes) != 0 || !buf)
+        throw std::runtime_error("cannot allocate " + std::to_string(r->stage_bytes >> 20) + " MiB of RDMA staging");
+    r->stage = (uint8_t*) buf;
+    std::memset(r->stage, 0, r->stage_bytes);   // faulted in before the registration pins it
+    (void) mlock(r->stage, r->stage_bytes);
+    r->mr = r->dev->reg(r->stage, r->stage_bytes, false);
+    const wire::RdmaOk ok = holder_->rdma(r->qp->local());
+    r->qp->connect(ok.qp);
+    r->rkey = ok.rkey;
+    r->base = ok.base;
+    r->bytes = ok.bytes;
+    r->slot_of.assign((size_t) n_expert_, -1);
+    std::fprintf(stderr, "expert helper: RDMA from %s to its RAM window (%llu MiB): %d staging slots of %zu MiB, %d "
+                         "reads in flight\n",
+                 opt_.rdma_dev.c_str(), (unsigned long long) (ok.bytes >> 20), r->slots, r->slot_bytes >> 20,
+                 r->inflight);
+    rdma_ = std::move(r);
+    rdma_ok_ = true;
+}
+
+void Engine::take_held(const std::vector<wire::Held>& got, std::vector<std::pair<int32_t, int32_t>>& refuse,
+                       bool count_swap) {
+    for (const wire::Held& h : got) {
+        const int il = h.layer, e = h.expert;
+        if (il < 0 || il >= (int) layers_.size() || e < 0 || e >= n_expert_ || !runs(il) || !layers_[(size_t) il].moe)
+            continue;
+        const size_t i = (size_t) il * (size_t) n_expert_ + (size_t) e;
+        if (remote_[i]) continue;
+        const uint64_t b = expert_bytes(il) + 256;   // the helper pads each one so much
+        if (h.kind == wire::kInRam) {
+            // a hold this card cannot read is no hold: given back, and the expert stays a miss from its file
+            if (!rdma_ok_ || h.addr < rdma_->base || h.addr + expert_bytes(il) > rdma_->base + rdma_->bytes) {
+                refuse.emplace_back(il, e);
+                continue;
+            }
+            remote_[i] = kRemoteRam;
+            remote_addr_[i] = h.addr;
+            ++remote_ram_held_;
+            remote_ram_bytes_ += b;
+        } else {
+            remote_[i] = kRemoteDev;
+        }
+        ++remote_held_;
+        remote_bytes_ += b;
+        if (count_swap) ++stats_.helper_swapped;
+    }
+}
+
+// The helper holds this card's warmest experts after VRAM's, by the profile, in its share of the helper's room:
+// its devices' first, then its RAM window's (when this card reads it by RDMA), so the warmest after c4's VRAM go to
+// the helper's VRAM, the next to its RAM, and c4's RAM tier and the tier files rank theirs after (build_tiers()).
 // Two connections: holder_ holds (and releases, as the set follows the answer), helper_ computes.  The helper
 // frees a connection's holds when it ends, so a failed holder_ is a failed helper (helper_follow()).
 void Engine::hold_remote() {
     remote_.assign(layers_.size() * (size_t) n_expert_, 0);
     remote_pending_.assign(remote_.size(), 0);
-    remote_held_ = 0;
-    remote_bytes_ = remote_budget_ = 0;
+    remote_addr_.assign(remote_.size(), 0);
+    remote_held_ = remote_ram_held_ = 0;
+    remote_bytes_ = remote_budget_ = remote_ram_bytes_ = ram_budget_ = 0;
     if (opt_.expert_helper.empty() || n_moe_ == 0) return;
     const auto t0 = Clock::now();
     try {
         const uint64_t key = wire::model_key(gg_->bytes(), n_expert_, n_embd_, n_ff_exp_);
+        const bool want_ram = !opt_.rdma_dev.empty();
         helper_ = std::make_unique<RemoteHelper>(opt_.expert_helper, key, n_expert_, n_embd_, n_ff_exp_);
-        holder_ = std::make_unique<RemoteHelper>(opt_.expert_helper, key, n_expert_, n_embd_, n_ff_exp_);
+        holder_ = std::make_unique<RemoteHelper>(opt_.expert_helper, key, n_expert_, n_embd_, n_ff_exp_, want_ram);
+        if (want_ram) {
+            try {
+                setup_rdma();
+            } catch (const std::exception& e) {
+                // the RAM is not asked for: a connection that did not ask for it is never given any
+                std::fprintf(stderr, "expert helper: RDMA: %s; its RAM is not asked for, its devices are\n", e.what());
+                rdma_.reset();
+                rdma_ok_ = false;
+                holder_ = std::make_unique<RemoteHelper>(opt_.expert_helper, key, n_expert_, n_embd_, n_ff_exp_);
+            }
+        }
         // this card's share of what the helper holds, as of the RAM and tier budgets
         uint64_t budget = helper_->capacity();
         if (opt_.expert_helper_mib > 0) budget = std::min<uint64_t>(budget, (uint64_t) opt_.expert_helper_mib << 20);
-        remote_budget_ = (uint64_t) ((double) budget * tier_share());
+        const uint64_t dev_budget = (uint64_t) ((double) budget * tier_share());
+        if (rdma_ok_) {
+            uint64_t ram = holder_->ram_capacity();
+            if (opt_.helper_ram_mib > 0) ram = std::min<uint64_t>(ram, (uint64_t) opt_.helper_ram_mib << 20);
+            ram_budget_ = (uint64_t) ((double) ram * tier_share());
+        }
+        remote_budget_ = dev_budget + ram_budget_;
         helper_layer_bytes_.assign(layers_.size(), 0);
         for (int il = 0; il < (int) layers_.size(); ++il)
             if (layers_[(size_t) il].moe && runs(il)) helper_layer_bytes_[(size_t) il] = expert_bytes(il) + 256;
         std::vector<int64_t> counts(use_.size(), 0);
         for (size_t i = 0; i < counts.size(); ++i) counts[i] = (i < prior_.size() ? prior_[i] : 0) + use_[i];
-        std::vector<std::pair<int32_t, int32_t>> want;
-        uint64_t used = 0;
-        for (const auto& le : tier_order(counts, false)) {
-            const uint64_t b = expert_bytes(le.first) + 256;   // the helper pads each one so much
-            if (used + b > remote_budget_) continue;
-            want.push_back(le);
-            used += b;
-        }
-        uint64_t bytes = 0;
-        for (const wire::Held& h : holder_->hold(want, wire::kDeviceOnly)) {
-            const int il = h.layer, e = h.expert;
-            if (h.kind != wire::kOnDevice || il < 0 || il >= (int) layers_.size() || e < 0 || e >= n_expert_ || !runs(il) ||
-                !layers_[(size_t) il].moe)
-                continue;
-            remote_[(size_t) il * (size_t) n_expert_ + (size_t) e] = 1;
-            ++remote_held_;
-            bytes += expert_bytes(il);
-            remote_bytes_ += expert_bytes(il) + 256;
-        }
-        std::fprintf(stderr, "expert helper: %lld experts (%llu MiB) on %s, %d GPU(s) there, in %.1f s%s\n",
-                     (long long) remote_held_, (unsigned long long) (bytes >> 20), helper_->addr().c_str(),
-                     helper_->devices(), std::chrono::duration<double>(Clock::now() - t0).count(),
+        // the warmest not held yet that fit `cap` bytes (in heat order, skipping one too large for what is left)
+        auto warmest = [&](uint64_t cap) {
+            std::vector<std::pair<int32_t, int32_t>> want;
+            uint64_t used = 0;
+            for (const auto& le : tier_order(counts, false)) {
+                const uint64_t b = expert_bytes(le.first) + 256;   // the helper pads each one so much
+                if (used + b > cap) continue;
+                want.push_back(le);
+                used += b;
+            }
+            return want;
+        };
+        std::vector<std::pair<int32_t, int32_t>> refuse;
+        take_held(holder_->hold(warmest(dev_budget), wire::kDeviceOnly), refuse, false);
+        const int64_t on_device = remote_held_;
+        const uint64_t dev_bytes = remote_bytes_;
+        // the next warmest in RAM: tier_order() leaves out what the devices took
+        if (ram_budget_ > 0) take_held(holder_->hold(warmest(ram_budget_), wire::kRamOnly), refuse, false);
+        if (!refuse.empty()) holder_->release(refuse);
+        std::fprintf(stderr, "expert helper: %lld experts (%llu MiB) on %s, %d GPU(s) there, %lld (%llu MiB) in its "
+                             "RAM, in %.1f s%s\n",
+                     (long long) on_device, (unsigned long long) (dev_bytes >> 20), helper_->addr().c_str(),
+                     helper_->devices(), (long long) remote_ram_held_, (unsigned long long) (remote_ram_bytes_ >> 20),
+                     std::chrono::duration<double>(Clock::now() - t0).count(),
                      opt_.helper_swaps > 0 ? "; its set follows the answers" : "");
         if (opt_.helper_swaps > 0) helper_thread_ = std::thread([this] { helper_loop(); });
     } catch (const std::exception& e) {
         std::fprintf(stderr, "expert helper: %s; this card runs without it\n", e.what());
         helper_.reset();
         holder_.reset();
+        rdma_.reset();
+        rdma_ok_ = false;
         std::fill(remote_.begin(), remote_.end(), 0);
-        remote_held_ = 0;
-        remote_bytes_ = 0;
+        remote_held_ = remote_ram_held_ = 0;
+        remote_bytes_ = remote_ram_bytes_ = 0;
     }
 }
 
@@ -2162,10 +2277,40 @@ void Engine::drop_helper(const char* why) {
     stop_helper_thread();
     helper_.reset();
     holder_.reset();
+    rdma_.reset();   // the helper's side of the queue pair ended with holder_
+    rdma_ok_ = false;
     std::fill(remote_.begin(), remote_.end(), 0);
     std::fill(remote_pending_.begin(), remote_pending_.end(), 0);
-    remote_held_ = 0;
-    remote_bytes_ = 0;
+    remote_held_ = remote_ram_held_ = 0;
+    remote_bytes_ = remote_ram_bytes_ = 0;
+    rdma_release_.clear();
+}
+
+// The RAM set alone: the helper's devices go on computing theirs.  The RAM experts are this card's misses from
+// their file spans from now on (each kept its span), and are given back with the next trade, or at once when no
+// thread trades.  The queue pair stays until the helper goes, as a failed one flushes what was posted on it.
+void Engine::drop_rdma(const char* why) {
+    std::fprintf(stderr, "expert helper: RDMA: %s; this card reads its %lld experts in the helper's RAM from the file "
+                         "from now on\n",
+                 why, (long long) remote_ram_held_);
+    rdma_ok_ = false;
+    for (size_t i = 0; i < remote_.size(); ++i) {
+        if (remote_[i] != kRemoteRam) continue;
+        remote_[i] = 0;
+        rdma_release_.emplace_back((int32_t) (i / (size_t) n_expert_), (int32_t) (i % (size_t) n_expert_));
+    }
+    remote_held_ -= remote_ram_held_;
+    remote_bytes_ -= std::min(remote_bytes_, remote_ram_bytes_);
+    remote_budget_ -= std::min(remote_budget_, ram_budget_);
+    remote_ram_held_ = 0;
+    remote_ram_bytes_ = ram_budget_ = 0;
+    if (!helper_thread_.joinable() && holder_) {
+        try {
+            holder_->release(rdma_release_);
+        } catch (const std::exception&) {   // the next Hold or Compute finds the helper gone and drops it
+        }
+        rdma_release_.clear();
+    }
 }
 
 void Engine::stop_helper_thread() {
@@ -2180,7 +2325,7 @@ void Engine::stop_helper_thread() {
     helper_quit_ = helper_busy_ = helper_asked_ = false;
     helper_in_.clear();
     helper_out_.clear();
-    helper_got_.clear();
+    helper_held_.clear();
     helper_error_.clear();
 }
 
@@ -2206,6 +2351,32 @@ int Engine::set_helper_swaps(int n) {
     return set;
 }
 
+int Engine::set_helper_ram(int on) {
+    int set = -1;
+    for (Engine* e = this; e; e = e->next_.get()) {
+        if (!e->rdma_ok_) continue;
+        e->rdma_on_ = on != 0;
+        set = e->rdma_on_ ? 1 : 0;
+    }
+    return set;
+}
+
+Engine::HelperFigures Engine::helper_figures() const {
+    HelperFigures f;
+    for (const Engine* e = this; e; e = e->next_.get()) {
+        if (e->rdma_ok_) f.ram = std::max(f.ram, e->rdma_on_ ? 1 : 0);
+        f.on_device += e->remote_held_ - e->remote_ram_held_;
+        f.in_ram += e->remote_ram_held_;
+        f.device_mib += (int64_t) ((e->remote_bytes_ - e->remote_ram_bytes_) >> 20);
+        f.ram_mib += (int64_t) (e->remote_ram_bytes_ >> 20);
+    }
+    return f;
+}
+
+// While RAM reads are on, the helper's set trades as one: helper_trade() sees every held expert, the room is the
+// devices' and the RAM's together, and the helper puts what comes over on a device if one has room, else in RAM
+// (kAny).  While they are off (set_helper_ram(0)) the RAM holds stand still, out of the trade's sight, and the
+// devices' set trades alone as it did before the window, so that switching back finds them where they were.
 void Engine::helper_follow(int written) {
     if (!holder_) return;
     {
@@ -2219,47 +2390,71 @@ void Engine::helper_follow(int written) {
         if (helper_busy_) return;
         if (helper_asked_) {
             for (const auto& [il, e] : helper_in_) remote_pending_[(size_t) il * (size_t) n_expert_ + (size_t) e] = 0;
-            for (const auto& [il, e] : helper_got_) {
-                if (il < 0 || il >= (int) layers_.size() || e < 0 || e >= n_expert_ || !runs(il)) continue;
-                uint8_t& r = remote_[(size_t) il * (size_t) n_expert_ + (size_t) e];
-                if (r) continue;
-                r = 1;
-                ++remote_held_;
-                remote_bytes_ += expert_bytes(il) + 256;
-                ++stats_.helper_swapped;
-            }
+            take_held(helper_held_, rdma_release_, true);
             helper_in_.clear();
             helper_out_.clear();
-            helper_got_.clear();
+            helper_held_.clear();
             helper_asked_ = false;
         }
     }
-    if (written <= 0 || recent_.empty() || opt_.helper_swaps <= 0 || !helper_thread_.joinable()) return;
+    if (!helper_thread_.joinable()) return;
+    const bool trade = written > 0 && !recent_.empty() && opt_.helper_swaps > 0;
+    if (!trade && rdma_release_.empty()) return;
     const size_t ne = (size_t) n_expert_;
-    vram_mask_.assign(remote_.size(), 0);
-    for (int il = 0; il < (int) layers_.size(); ++il) {
-        const Layer& L = layers_[(size_t) il];
-        if (helper_layer_bytes_[(size_t) il] == 0) continue;
-        for (int e = 0; e < n_expert_; ++e) {
-            const size_t i = (size_t) il * ne + (size_t) e;
-            vram_mask_[i] = L.slot[(size_t) e] != nullptr || (!coming_.empty() && coming_[i]);
+    HelperTrade t;
+    const bool live = rdma_live();
+    if (trade) {
+        vram_mask_.assign(remote_.size(), 0);
+        for (int il = 0; il < (int) layers_.size(); ++il) {
+            const Layer& L = layers_[(size_t) il];
+            if (helper_layer_bytes_[(size_t) il] == 0) continue;
+            for (int e = 0; e < n_expert_; ++e) {
+                const size_t i = (size_t) il * ne + (size_t) e;
+                vram_mask_[i] = L.slot[(size_t) e] != nullptr || (!coming_.empty() && coming_[i]);
+            }
         }
+        const uint8_t* held = remote_.data();
+        const uint8_t* pending = remote_pending_.data();
+        uint64_t budget = remote_budget_, bytes = remote_bytes_;
+        if (!live && remote_ram_held_ > 0) {   // the RAM holds out of sight: neither traded out nor asked for
+            trade_remote_.assign(remote_.begin(), remote_.end());
+            trade_pending_.assign(remote_pending_.begin(), remote_pending_.end());
+            for (size_t i = 0; i < remote_.size(); ++i)
+                if (remote_[i] == kRemoteRam) {
+                    trade_remote_[i] = 0;
+                    trade_pending_[i] = 1;
+                }
+            held = trade_remote_.data();
+            pending = trade_pending_.data();
+        }
+        if (!live) {
+            budget -= std::min(budget, ram_budget_);
+            bytes -= std::min(bytes, remote_ram_bytes_);
+        }
+        const uint64_t room = budget > bytes ? budget - bytes : 0;
+        t = helper_trade((int) layers_.size(), n_expert_, recent_.data(), prior_.empty() ? nullptr : prior_.data(),
+                         vram_mask_.data(), held, pending, helper_layer_bytes_.data(), room, opt_.helper_swaps);
     }
-    const uint64_t room = remote_budget_ > remote_bytes_ ? remote_budget_ - remote_bytes_ : 0;
-    HelperTrade t = helper_trade((int) layers_.size(), n_expert_, recent_.data(),
-                                 prior_.empty() ? nullptr : prior_.data(), vram_mask_.data(), remote_.data(),
-                                 remote_pending_.data(), helper_layer_bytes_.data(), room, opt_.helper_swaps);
-    if (t.in.empty() && t.out.empty()) return;
+    if (t.in.empty() && t.out.empty() && rdma_release_.empty()) return;
     for (const auto& [il, e] : t.out) {
-        remote_[(size_t) il * ne + (size_t) e] = 0;
+        const size_t i = (size_t) il * ne + (size_t) e;
+        const uint64_t b = expert_bytes(il) + 256;
+        if (remote_[i] == kRemoteRam) {
+            --remote_ram_held_;
+            remote_ram_bytes_ -= std::min<uint64_t>(remote_ram_bytes_, b);
+        }
+        remote_[i] = 0;
         --remote_held_;
-        remote_bytes_ -= std::min<uint64_t>(remote_bytes_, expert_bytes(il) + 256);
+        remote_bytes_ -= std::min<uint64_t>(remote_bytes_, b);
     }
     for (const auto& [il, e] : t.in) remote_pending_[(size_t) il * ne + (size_t) e] = 1;
+    t.out.insert(t.out.end(), rdma_release_.begin(), rdma_release_.end());
+    rdma_release_.clear();
     {
         std::lock_guard<std::mutex> l(helper_m_);
         helper_in_ = std::move(t.in);
         helper_out_ = std::move(t.out);
+        helper_where_ = live ? wire::kAny : wire::kDeviceOnly;
         helper_busy_ = helper_asked_ = true;
     }
     helper_cv_.notify_one();
@@ -2271,18 +2466,18 @@ void Engine::helper_loop() {
         helper_cv_.wait(lk, [&] { return helper_quit_ || helper_busy_; });
         if (helper_quit_) return;
         const std::vector<std::pair<int32_t, int32_t>> in = helper_in_, out = helper_out_;
+        const wire::Where where = helper_where_;
         lk.unlock();
-        std::vector<std::pair<int32_t, int32_t>> got;
+        std::vector<wire::Held> got;
         std::string err;
         try {
             holder_->release(out);   // the room first
-            if (!in.empty())
-                for (const wire::Held& h : holder_->hold(in, wire::kDeviceOnly)) got.emplace_back(h.layer, h.expert);
+            if (!in.empty()) got = holder_->hold(in, where);
         } catch (const std::exception& e) {
             err = e.what();
         }
         lk.lock();
-        helper_got_ = std::move(got);
+        helper_held_ = std::move(got);
         if (!err.empty()) helper_error_ = err;
         helper_busy_ = false;
     }
@@ -2458,6 +2653,11 @@ const Stats& Engine::stats() const {
         all_stats_.cpu_tier_experts += s.cpu_tier_experts;
         all_stats_.cpu_file_experts += s.cpu_file_experts;
         all_stats_.helper_swapped += s.helper_swapped;
+        all_stats_.cpu_rdma_experts += s.cpu_rdma_experts;
+        all_stats_.rdma_reads += s.rdma_reads;
+        all_stats_.rdma_bytes += s.rdma_bytes;
+        all_stats_.rdma_ms += s.rdma_ms;
+        all_stats_.rdma_wait_ms += s.rdma_wait_ms;
         all_stats_.cpu_ms += s.cpu_ms;
         all_stats_.route_wait_ms += s.route_wait_ms;
     }
@@ -2603,7 +2803,8 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         Cached cached[kCpuRows * kMaxUsed];
         wire::Entry remote[kCpuRows * kMaxUsed];   // the helper's GPUs hold these (hold_remote())
         int32_t host_e[kCpuRows * kMaxUsed], host_k[kCpuRows * kMaxUsed];   // a host entry's expert and its place
-        int n_host = 0, n_cached = 0, n_remote = 0;
+        uint8_t host_rd[kCpuRows * kMaxUsed];   // 1: its bytes come by RDMA from the helper's RAM
+        int n_host = 0, n_cached = 0, n_remote = 0, n_rd = 0;
         for (int t = 0; t < m; ++t) {
             int ids[kMaxUsed];
             float w[kMaxUsed];
@@ -2617,39 +2818,48 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                     cached[n_cached++] = {s, w[k], at + t};
                     continue;
                 }
-                if (helper_ && remote_at(il, (int) e)) {
+                const uint8_t held = helper_ ? remote_[(size_t) il * n_expert_ + e] : 0;
+                if (held == kRemoteDev) {
                     remote[n_remote++] = {(int32_t) e, t, w[k]};
                     continue;
                 }
+                host_rd[n_host] = held == kRemoteRam && rdma_live();
+                n_rd += host_rd[n_host];
                 host_e[n_host] = (int32_t) e;
                 host_k[n_host] = k;
                 host[n_host++] = {L.src[(size_t) e].gate, L.src[(size_t) e].up,
                                   L.src[(size_t) e].down, w[k], t};
             }
         }
-        for (int i = 0; i < n_host; ++i) {   // each missed expert's bytes start reading once, in routing order
-            bool seen = false;
-            for (int j = 0; j < i && !seen; ++j) seen = host_e[j] == host_e[i];
-            if (!seen) will_need_expert(L.src[(size_t) host_e[i]], L.gu_bytes, L.d_bytes);
-        }
         // Strata's STRATA_ROUTE_TAIL_SKIP: an expert outside VRAM that every token here ranks at tail_skip or later
         // adds little to any of them, so it is not computed.  The others keep the weights the router gave them.
         if (opt_.tail_skip > 0) {
-            int kept = 0;
+            bool keep[kCpuRows * kMaxUsed];
             for (int i = 0; i < n_host; ++i) {
                 bool low = true;
                 for (int j = 0; j < n_host && low; ++j) low = host_e[j] != host_e[i] || host_k[j] >= opt_.tail_skip;
+                keep[i] = !low;
                 if (low) ++stats_.tail_experts;
-                else host[kept++] = host[i];
+            }
+            int kept = 0;
+            n_rd = 0;
+            for (int i = 0; i < n_host; ++i) {
+                if (!keep[i]) continue;
+                host[kept] = host[i];
+                host_e[kept] = host_e[i];
+                host_rd[kept] = host_rd[i];
+                n_rd += host_rd[kept++];
             }
             n_host = kept;
         }
-        for (int i = 0; i < n_host; ++i) {   // where the CPU reads them from: what the tiers and the helper leave
-            const uint8_t* g = host[i].gate;
-            if (ram_tier_ && g >= (const uint8_t*) ram_tier_ && g < (const uint8_t*) ram_tier_ + ram_tier_bytes_)
-                ++stats_.cpu_ram_experts;
-            else if (in_tier(g)) ++stats_.cpu_tier_experts;
-            else ++stats_.cpu_file_experts;
+        // The RAM-held misses' READs go out first: they are on the wire while the file's read-ahead starts and the
+        // helper computes its own (rdma_wait() below).  One that finds no staging slot is read from the file.
+        if (n_rd > 0 && !rdma_post(L, host_e, host_rd, n_host)) n_rd = 0;
+        for (int i = 0; i < n_host; ++i) {   // each missed expert's bytes start reading once, in routing order
+            if (n_rd > 0 && host_rd[i]) continue;
+            bool seen = false;
+            for (int j = 0; j < i && !seen; ++j) seen = host_e[j] == host_e[i];
+            if (!seen) will_need_expert(L.src[(size_t) host_e[i]], L.gu_bytes, L.d_bytes);
         }
         // The helper's experts go first, so that its GPUs work while this machine's CPU does; its answer is read
         // after the CPU's experts.  When it cannot be reached, they are computed here with the rest.
@@ -2670,6 +2880,16 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                 std::stable_sort(host, host + n_host, [](const CpuExpert& a, const CpuExpert& b) { return a.row < b.row; });
                 n_remote = 0;
             }
+        }
+        // the RAM-held misses' bytes, in the staging slots, before the CPU starts on them
+        if (n_rd > 0 && (!rdma_ || !rdma_wait(L, host, n_host))) n_rd = 0;   // a failed helper took the reads along
+        for (int i = 0; i < n_host; ++i) {   // where the CPU reads them from: what the tiers and the helper leave
+            const uint8_t* g = host[i].gate;
+            if (ram_tier_ && g >= (const uint8_t*) ram_tier_ && g < (const uint8_t*) ram_tier_ + ram_tier_bytes_)
+                ++stats_.cpu_ram_experts;
+            else if (rdma_ && rdma_->holds(g)) ++stats_.cpu_rdma_experts;
+            else if (in_tier(g)) ++stats_.cpu_tier_experts;
+            else ++stats_.cpu_file_experts;
         }
         stats_.gpu_experts += n_cached;
         stats_.cpu_experts += n_host;
@@ -2778,6 +2998,101 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         }
     }
     return any_host;
+}
+
+// Each distinct RAM-held expert of the window gets a staging slot and an RDMA READ of its whole gate | up | down
+// (the helper keeps them back to back), up to the in-flight cap now and the rest from rdma_wait() as reads
+// complete.  More distinct ones than slots: the extra are read from the file (host_rd cleared, so their read-ahead
+// starts).
+bool Engine::rdma_post(const Layer& L, const int32_t* host_e, uint8_t* host_rd, int n_host) {
+    RdmaPath& r = *rdma_;
+    r.order.clear();
+    r.posted = r.done = 0;
+    for (int i = 0; i < n_host; ++i) {
+        if (!host_rd[i]) continue;
+        int32_t& s = r.slot_of[(size_t) host_e[i]];
+        if (s >= 0) continue;
+        if ((int) r.order.size() >= r.slots) {
+            host_rd[i] = 0;
+            continue;
+        }
+        s = (int32_t) r.order.size();
+        r.order.push_back(host_e[i]);
+    }
+    for (int i = 0; i < n_host; ++i)   // an entry whose expert found no slot (an earlier entry was cleared above)
+        if (host_rd[i] && r.slot_of[(size_t) host_e[i]] < 0) host_rd[i] = 0;
+    const int il = (int) (&L - layers_.data());
+    const uint32_t len = (uint32_t) (2 * L.gu_bytes + L.d_bytes);
+    r.t0 = Clock::now();
+    try {
+        while (r.posted < (int) r.order.size() && r.posted < r.inflight) {
+            const int32_t e = r.order[(size_t) r.posted];
+            r.qp->post_read(r.stage + (size_t) r.posted * r.slot_bytes, r.mr.lkey,
+                            remote_addr_[(size_t) il * n_expert_ + (size_t) e], r.rkey, len, (uint64_t) r.posted);
+            ++r.posted;
+        }
+    } catch (const std::exception& e) {
+        for (int32_t x : r.order) r.slot_of[(size_t) x] = -1;
+        drop_rdma(e.what());
+        return false;
+    }
+    return true;
+}
+
+bool Engine::rdma_wait(const Layer& L, CpuExpert* host, int n_host) {
+    RdmaPath& r = *rdma_;
+    const int il = (int) (&L - layers_.data());
+    const uint32_t len = (uint32_t) (2 * L.gu_bytes + L.d_bytes);
+    const auto w0 = Clock::now();
+    bool ok = true;
+    try {
+        uint64_t ids[32];
+        while (r.done < (int) r.order.size()) {
+            r.done += r.qp->poll(ids, 32, 10000);
+            while (r.posted < (int) r.order.size() && r.posted - r.done < r.inflight) {
+                const int32_t e = r.order[(size_t) r.posted];
+                r.qp->post_read(r.stage + (size_t) r.posted * r.slot_bytes, r.mr.lkey,
+                                remote_addr_[(size_t) il * n_expert_ + (size_t) e], r.rkey, len, (uint64_t) r.posted);
+                ++r.posted;
+            }
+        }
+    } catch (const std::exception& e) {
+        ok = false;
+        for (int32_t x : r.order) r.slot_of[(size_t) x] = -1;
+        drop_rdma(e.what());
+    }
+    const auto t1 = Clock::now();
+    if (!ok) return false;
+    stats_.rdma_reads += (int64_t) r.order.size();
+    stats_.rdma_bytes += (int64_t) r.order.size() * len;
+    stats_.rdma_ms += std::chrono::duration<double, std::milli>(t1 - r.t0).count();
+    stats_.rdma_wait_ms += std::chrono::duration<double, std::milli>(t1 - w0).count();
+    // STRATA_RDMA_CHECK=1: the first reads compared with the file's bytes (which this then reads too)
+    static const bool check = [] { const char* v = std::getenv("STRATA_RDMA_CHECK"); return v && v[0] == '1'; }();
+    static std::atomic<int> checked{0};
+    for (size_t k = 0; check && k < r.order.size(); ++k) {
+        if (checked.fetch_add(1) >= 40) break;
+        const int32_t e = r.order[k];
+        const uint8_t* got = r.stage + k * r.slot_bytes;
+        const TierSpan& f = L.src[(size_t) e];
+        const bool same = std::memcmp(got, f.gate, L.gu_bytes) == 0 && std::memcmp(got + L.gu_bytes, f.up, L.gu_bytes) == 0 &&
+                          std::memcmp(got + 2 * L.gu_bytes, f.down, L.d_bytes) == 0;
+        std::fprintf(stderr, "expert helper RDMA check: blk.%d expert %d: %s the file's bytes\n", il, e,
+                     same ? "the same as" : "NOT the same as");
+    }
+    // An entry is found by its file span, not its place: a helper that failed meanwhile added its experts and
+    // sorted the entries by token (moe()).
+    for (int i = 0; i < n_host; ++i)
+        for (size_t k = 0; k < r.order.size(); ++k)
+            if (host[i].gate == L.src[(size_t) r.order[k]].gate) {
+                const uint8_t* p = r.stage + k * r.slot_bytes;
+                host[i].gate = p;
+                host[i].up = p + L.gu_bytes;
+                host[i].down = p + 2 * L.gu_bytes;
+                break;
+            }
+    for (int32_t x : r.order) r.slot_of[(size_t) x] = -1;
+    return true;
 }
 
 // The CPU's experts of n tokens into the routed experts' sum.

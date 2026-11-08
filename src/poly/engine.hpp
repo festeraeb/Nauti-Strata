@@ -97,6 +97,15 @@ struct Options {
     int helper_swaps = 8;         ///< while an answer is written, the helper's set follows it: up to this many of the
                                   ///< experts the answer keeps missing go over at a time, in the room of the ones it
                                   ///< uses least (helper_trade()); 0: the set stays as hold_remote() chose it
+    // The helper's RAM window (strata-expert-helper --ram-mib): the warmest after its VRAM's are held there, and a
+    // miss on one is an RDMA READ of its bytes into a staging slot here, computed on the CPU as one from RAM.
+    std::string rdma_dev;         ///< this machine's RoCE port, "DEV:PORT:GID" (c4: rocep135s0f1:1:5); empty: no
+                                  ///< RDMA, and the helper's RAM is never asked for
+    int rdma_inflight = 16;       ///< RDMA READs outstanding at a time on a card's queue pair
+    int rdma_slots = 0;           ///< staging slots a card (each the largest expert); 0: one a possible miss in a
+                                  ///< window, kCpuRows x the experts a token
+    int helper_ram_mib = 0;       ///< what the engine asks the helper to hold in RAM at most, all cards together;
+                                  ///< 0: all its window has
 };
 
 /// A thing a model's file may call by other names than the engine does: converters differ.
@@ -155,6 +164,11 @@ struct Stats {
     /// cpu_experts by where the CPU read them: the RAM tier, a tier file (the Optane), or the model's file
     int64_t cpu_ram_experts = 0, cpu_tier_experts = 0, cpu_file_experts = 0;
     int64_t helper_swapped = 0;    ///< experts the helper took over while answers were written (helper_follow())
+    /// cpu_experts whose bytes were read by RDMA from the helper's RAM window (Options::rdma_dev), and those reads:
+    /// how many, their bytes, the time from a window's first post to its last completion, and the time this
+    /// thread waited for them
+    int64_t cpu_rdma_experts = 0, rdma_reads = 0, rdma_bytes = 0;
+    double rdma_ms = 0, rdma_wait_ms = 0;
     double cpu_ms = 0, route_wait_ms = 0;
 };
 
@@ -490,11 +504,25 @@ protected:
     /// After the VRAM cache: the warmest of the rest that the helper's GPUs will hold, before RAM and the tiers
     /// rank theirs (Options::expert_helper).
     void hold_remote();
+    /// The helper holds it, on a device or in RAM.
     bool remote_at(int il, int e) const {
         return !remote_.empty() && remote_[(size_t) il * (size_t) n_expert_ + (size_t) e];
     }
     /// The helper failed: its experts are computed here from now on, from the model's file.
     void drop_helper(const char* why);
+    /// RDMA to the helper's RAM window (Options::rdma_dev): the queue pair on holder_, and the staging slots.
+    void setup_rdma();
+    bool rdma_live() const { return rdma_ok_ && rdma_on_; }
+    /// An RDMA READ failed: the helper's RAM experts are read from their file spans from now on, and given back.
+    void drop_rdma(const char* why);
+    /// Marks what a Hold answered; a RAM hold this card cannot read goes into `refuse`.
+    void take_held(const std::vector<wire::Held>& got, std::vector<std::pair<int32_t, int32_t>>& refuse,
+                   bool count_swap);
+    /// A window's RAM-held misses: their READs posted (rdma_post()), then waited for and their host entries
+    /// pointed at the staging slots (rdma_wait()).  False from either: the reads failed, drop_rdma() is done, and
+    /// the entries kept their file spans.
+    bool rdma_post(const Layer& L, const int32_t* host_e, uint8_t* host_rd, int n_host);
+    bool rdma_wait(const Layer& L, CpuExpert* host, int n_host);
     /// The helper's set follows the answer (helper_trade()): called from follow() with the tokens written.  Takes
     /// what the last trade brought, then asks the helper thread for the next one.
     void helper_follow(int written);
@@ -504,6 +532,17 @@ public:
     /// it is), on every card.  Returns what is set; -1 when there is no helper.
     int set_helper_swaps(int n);
     int helper_swaps() const { return holder_ ? opt_.helper_swaps : -1; }
+    /// Between requests: whether a miss on an expert in the helper's RAM is read from there (1) or from the file
+    /// as if it were not held (0), on every card; the holds stay, so it can be switched back without a reload.
+    /// Returns what is set; -1 when no card reads the helper's RAM.
+    int set_helper_ram(int on);
+    /// The helper's figures over every card: RAM reads on, the experts it holds on its devices and in RAM, and
+    /// their MiB.
+    struct HelperFigures {
+        int ram = -1;   ///< -1: no card reads the helper's RAM
+        int64_t on_device = 0, in_ram = 0, device_mib = 0, ram_mib = 0;
+    };
+    HelperFigures helper_figures() const;
 protected:
     void stop_helper_thread();
     bool in_tier(const void* p) const;   ///< p is in one of the tier files' mappings
@@ -817,8 +856,22 @@ protected:
     std::mutex helper_m_;
     std::condition_variable helper_cv_;
     bool helper_quit_ = false, helper_busy_ = false, helper_asked_ = false;
-    std::vector<std::pair<int32_t, int32_t>> helper_in_, helper_out_, helper_got_;   ///< the trade out, and its answer
+    std::vector<std::pair<int32_t, int32_t>> helper_in_, helper_out_;   ///< the trade out (its answer: helper_held_)
     std::string helper_error_;              ///< why the thread's last trade failed; helper_follow() drops the helper
+    // The helper's RAM window (Options::rdma_dev).  remote_ is 1 for an expert the helper computes (on a device)
+    // and 2 for one in its RAM, read by RDMA at remote_addr_.
+    static constexpr uint8_t kRemoteDev = 1, kRemoteRam = 2;
+    struct RdmaPath;
+    std::unique_ptr<RdmaPath> rdma_;
+    bool rdma_ok_ = false;                  ///< set up and not failed
+    bool rdma_on_ = true;                   ///< set_helper_ram()
+    std::vector<uint64_t> remote_addr_;     ///< per (layer, expert) held in RAM: its bytes in the helper's window
+    int64_t remote_ram_held_ = 0;
+    uint64_t remote_ram_bytes_ = 0, ram_budget_ = 0;   ///< of remote_bytes_ and remote_budget_: the RAM part
+    std::vector<std::pair<int32_t, int32_t>> rdma_release_;   ///< RAM holds to give back with the next trade
+    wire::Where helper_where_ = wire::kDeviceOnly;   ///< where the trade out may be held
+    std::vector<wire::Held> helper_held_;   ///< the trade's answer, with where each went
+    std::vector<uint8_t> trade_remote_, trade_pending_;   ///< helper_trade()'s view while RAM reads are off
     int64_t ram_experts_ = 0, tier_experts_ = 0;   ///< experts in each
     Stats stats_;
 };
