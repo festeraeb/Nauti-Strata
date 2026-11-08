@@ -105,6 +105,23 @@ option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
 # #2027: defined here, before the GPU section reads it to register the native-expert tests (it was defined at the
 # native-experts section far below, so a first configure registered four tests fewer than the second)
 option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
+# The expert helper's RAM window read over RoCE (docs/REMOTE_TIER_PLAN.md): strata-poly and strata-expert-helper
+# link libibverbs.  OFF builds the same programs without it; --rdma-dev / --rdma then say the build has no RDMA.
+option(STRATA_RDMA "Read the expert helper's RAM window by RDMA (links libibverbs)" OFF)
+if(STRATA_RDMA)
+  find_path(STRATA_IBVERBS_INCLUDE infiniband/verbs.h)
+  find_library(STRATA_IBVERBS_LIB ibverbs)
+  if(NOT STRATA_IBVERBS_INCLUDE OR NOT STRATA_IBVERBS_LIB)
+    message(FATAL_ERROR "STRATA_RDMA=ON needs libibverbs and its header (rdma-core: libibverbs-dev / rdma-core)")
+  endif()
+endif()
+function(strata_rdma target)
+  if(STRATA_RDMA)
+    target_compile_definitions(${target} PRIVATE STRATA_RDMA=1)
+    target_include_directories(${target} PRIVATE ${STRATA_IBVERBS_INCLUDE})
+    target_link_libraries(${target} PRIVATE ${STRATA_IBVERBS_LIB})
+  endif()
+endfunction()
 
 if(STRATA_BUILD_CONVERSATION_TESTS)
   enable_testing()
@@ -260,10 +277,22 @@ if(STRATA_BUILD_TESTS)
   add_executable(expert_tier_test src/poly/expert_tier_test.cpp src/poly/expert_tier.cpp)
   target_include_directories(expert_tier_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   add_test(NAME expert_tier_test COMMAND expert_tier_test)
-  # the expert helper's messages over a loopback TCP connection (no CUDA)
-  add_executable(expert_wire_test src/poly/expert_wire_test.cpp src/poly/expert_wire.cpp)
+  # the expert helper's messages over a loopback TCP connection, the engine's client, the RAM window's places
+  # (no CUDA, no verbs: expert_rdma.cpp is built without them here)
+  add_executable(expert_wire_test src/poly/expert_wire_test.cpp src/poly/expert_wire.cpp src/poly/remote_helper.cpp
+                                  src/poly/expert_rdma.cpp)
   target_link_libraries(expert_wire_test PRIVATE Threads::Threads)
   add_test(NAME expert_wire_test COMMAND expert_wire_test)
+  if(STRATA_RDMA)
+    # the RAM window's read path on a real RoCE port looped back to itself; passes as skipped without
+    # STRATA_RDMA_TEST_PORT (t440: rocep1s0f1:1:3)
+    add_executable(expert_rdma_test src/poly/expert_rdma_test.cpp src/poly/expert_rdma.cpp src/poly/expert_wire.cpp
+                                    src/poly/remote_helper.cpp)
+    target_include_directories(expert_rdma_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(expert_rdma_test PRIVATE Threads::Threads)
+    strata_rdma(expert_rdma_test)
+    add_test(NAME expert_rdma_test COMMAND expert_rdma_test)
+  endif()
   # the helper's set follows the answer: which experts trade (no CUDA)
   add_executable(expert_follow_test src/poly/expert_follow_test.cpp)
   target_include_directories(expert_follow_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -1855,8 +1884,9 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   add_executable(strata-poly src/poly/main.cpp src/poly/engine.cpp src/poly/glm5next.cpp src/poly/qwen35.cpp
                             src/poly/gemma4.cpp src/poly/deepseek4.cpp src/poly/lfm2moe.cpp src/poly/cpu_experts.cpp
                             src/poly/mistral_large4.cpp src/poly/ml4_layout.cpp src/poly/expert_tier.cpp
-                            src/poly/expert_wire.cpp src/poly/remote_helper.cpp
+                            src/poly/expert_wire.cpp src/poly/remote_helper.cpp src/poly/expert_rdma.cpp
                             src/poly/kernels.cu src/poly/kernels_dsv4.cu src/core/conversation_memory.cpp)
+  strata_rdma(strata-poly)
   target_include_directories(strata-poly PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   # the driver's virtual memory calls: the attention caches grow with the conversation; on HIP they are HIP's
   # memory management calls, which the HIP runtime itself provides (hip_compat/cuda.h)
@@ -1870,7 +1900,9 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
                                            ${_strata_poly_driver}
                                            Threads::Threads)
   # another machine's GPUs holding an engine's experts (--expert-helper on the engine's side)
-  add_executable(strata-expert-helper src/poly/expert_helper.cpp src/poly/expert_wire.cpp src/poly/kernels.cu)
+  add_executable(strata-expert-helper src/poly/expert_helper.cpp src/poly/expert_wire.cpp src/poly/expert_rdma.cpp
+                                      src/poly/kernels.cu)
+  strata_rdma(strata-expert-helper)
   target_include_directories(strata-expert-helper PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                          ${_strata_gpu_include_directories})
   target_link_libraries(strata-expert-helper PRIVATE strata_kernels ggml-base ${_strata_gpu_blas_target}
@@ -1887,9 +1919,10 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   add_executable(poly_draft_race_test src/poly/draft_race_test.cpp src/poly/engine.cpp src/poly/glm5next.cpp
                                       src/poly/qwen35.cpp src/poly/gemma4.cpp src/poly/deepseek4.cpp
                                       src/poly/lfm2moe.cpp src/poly/mistral_large4.cpp src/poly/ml4_layout.cpp src/poly/expert_tier.cpp
-                                      src/poly/expert_wire.cpp src/poly/remote_helper.cpp
+                                      src/poly/expert_wire.cpp src/poly/remote_helper.cpp src/poly/expert_rdma.cpp
                                       src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
                                       src/core/conversation_memory.cpp)
+  strata_rdma(poly_draft_race_test)
   target_include_directories(poly_draft_race_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                          ${_strata_gpu_include_directories})
   target_link_libraries(poly_draft_race_test PRIVATE strata_poly_mmq strata_kernels strata_spec ggml-cpu ggml-base

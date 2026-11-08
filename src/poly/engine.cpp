@@ -2129,8 +2129,9 @@ void Engine::hold_remote() {
             used += b;
         }
         uint64_t bytes = 0;
-        for (const auto& [il, e] : holder_->hold(want)) {
-            if (il < 0 || il >= (int) layers_.size() || e < 0 || e >= n_expert_ || !runs(il) ||
+        for (const wire::Held& h : holder_->hold(want, wire::kDeviceOnly)) {
+            const int il = h.layer, e = h.expert;
+            if (h.kind != wire::kOnDevice || il < 0 || il >= (int) layers_.size() || e < 0 || e >= n_expert_ || !runs(il) ||
                 !layers_[(size_t) il].moe)
                 continue;
             remote_[(size_t) il * (size_t) n_expert_ + (size_t) e] = 1;
@@ -2275,7 +2276,8 @@ void Engine::helper_loop() {
         std::string err;
         try {
             holder_->release(out);   // the room first
-            if (!in.empty()) got = holder_->hold(in);
+            if (!in.empty())
+                for (const wire::Held& h : holder_->hold(in, wire::kDeviceOnly)) got.emplace_back(h.layer, h.expert);
         } catch (const std::exception& e) {
             err = e.what();
         }
